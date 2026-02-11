@@ -1,0 +1,98 @@
+name: 🔵 Leilo - Coleta Completa
+
+on:
+  # Execução manual
+  workflow_dispatch:
+  
+  # Cron automático
+  schedule:
+    - cron: '0 6 * * *'  # Diariamente às 6h UTC (3h BRT)
+
+jobs:
+  leilo-scraper:
+    name: 🔵 Leilo - Scrape Completo
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install Dependencies
+        run: |
+          pip install requests==2.31.0 python-dotenv==1.0.1
+      
+      - name: Run Leilo Scraper (7 Categorias)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          PYTHONPATH: ${{ github.workspace }}/scrapers
+        run: |
+          echo "========================================"
+          echo "🔵 LEILO.COM.BR - COLETA COMPLETA"
+          echo "========================================"
+          echo "📅 Início: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "🇧🇷 Horário Brasil: $(TZ='America/Sao_Paulo' date '+%Y-%m-%d %H:%M:%S BRT')"
+          echo "========================================"
+          echo ""
+          echo "🔥 Coletando TODAS as categorias via API:"
+          echo "   • Carros"
+          echo "   • Motos"
+          echo "   • Caminhões"
+          echo "   • Ônibus"
+          echo "   • Máquinas"
+          echo "   • Imóveis"
+          echo "   • Equipamentos"
+          echo ""
+          echo "========================================"
+          
+          cd scrapers/leilo
+          python scraper.py
+          
+          echo ""
+          echo "✅ Leilo concluído: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+      
+      - name: Upload Data (Debug)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: leilo-${{ github.run_number }}
+          path: scrapers/leilo/data/normalized/leilo_*.json
+          retention-days: 3
+      
+      - name: Generate Summary
+        if: always()
+        run: |
+          echo "## 🔵 Leilo.com.br - Coleta Completa" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "**Modo:** Manual" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Modo:** Cron (automático diário)" >> $GITHUB_STEP_SUMMARY
+            echo "**Frequência:** Diariamente às 6h UTC (3h BRT)" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Horário UTC:** $(date -u '+%Y-%m-%d %H:%M')" >> $GITHUB_STEP_SUMMARY
+          echo "**Horário Brasil:** $(TZ='America/Sao_Paulo' date '+%Y-%m-%d %H:%M')" >> $GITHUB_STEP_SUMMARY
+          echo "**Run ID:** ${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Categorias Processadas:" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Carros" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Motos" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Caminhões" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Ônibus" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Máquinas" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Imóveis" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Equipamentos" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Scraper:** API REST (rápido, ~5-10min)" >> $GITHUB_STEP_SUMMARY
+          echo "**Paginação:** Até 100 páginas por categoria" >> $GITHUB_STEP_SUMMARY
+          echo "**Delay:** 1s entre requests" >> $GITHUB_STEP_SUMMARY
