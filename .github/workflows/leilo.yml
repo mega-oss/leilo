@@ -1,33 +1,34 @@
 name: 🔵 Leilo - Coleta Completa
 
 on:
-  # Execução manual
   workflow_dispatch:
-  
-  # Cron automático
   schedule:
     - cron: '0 6 * * *'  # Diariamente às 6h UTC (3h BRT)
 
 jobs:
   leilo-scraper:
-    name: 🔵 Leilo - Scrape Completo
+    name: 🔵 Leilo - Scrape + Upload Supabase
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
-    
+    timeout-minutes: 90
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
+
       - name: Install Dependencies
         run: |
-          pip install requests==2.31.0 python-dotenv==1.0.1
-      
-      - name: Run Leilo Scraper (7 Categorias)
+          pip install requests==2.31.0 python-dotenv==1.0.1 playwright==1.44.0
+
+      - name: Install Playwright Browsers
+        run: |
+          playwright install chromium --with-deps
+
+      - name: Run Leilo Scraper (Todas as Categorias)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -40,44 +41,44 @@ jobs:
           echo "🇧🇷 Horário Brasil: $(TZ='America/Sao_Paulo' date '+%Y-%m-%d %H:%M:%S BRT')"
           echo "========================================"
           echo ""
-          echo "🔥 Coletando TODAS as categorias via API:"
+          echo "🔥 Coletando categorias:"
           echo "   • Carros"
           echo "   • Motos"
           echo "   • Caminhões"
           echo "   • Ônibus"
           echo "   • Máquinas"
-          echo "   • Imóveis"
           echo "   • Equipamentos"
           echo ""
+          echo "☁️  Destino: auctions.veiculos (Supabase)"
           echo "========================================"
-          
+
           cd scrapers/leilo
-          python scraper.py
-          
+          python leilo.py --all --output /tmp/leilo_coleta.json
+
           echo ""
           echo "✅ Leilo concluído: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-      
-      - name: Upload Data (Debug)
-        if: success()
+
+      - name: Upload JSON (Debug)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: leilo-${{ github.run_number }}
-          path: scrapers/leilo/data/normalized/leilo_*.json
+          path: /tmp/leilo_coleta.json
           retention-days: 3
-      
+
       - name: Generate Summary
         if: always()
         run: |
-          echo "## 🔵 Leilo.com.br - Coleta Completa" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔵 Leilo.com.br — Coleta + Upload Supabase" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          
+
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
             echo "**Modo:** Manual" >> $GITHUB_STEP_SUMMARY
           else
             echo "**Modo:** Cron (automático diário)" >> $GITHUB_STEP_SUMMARY
             echo "**Frequência:** Diariamente às 6h UTC (3h BRT)" >> $GITHUB_STEP_SUMMARY
           fi
-          
+
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
           echo "**Horário UTC:** $(date -u '+%Y-%m-%d %H:%M')" >> $GITHUB_STEP_SUMMARY
@@ -85,14 +86,16 @@ jobs:
           echo "**Run ID:** ${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### 📦 Categorias Processadas:" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Carros" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Motos" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Caminhões" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Ônibus" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Máquinas" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Imóveis" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Equipamentos" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Carros → tipo: carro" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Motos → tipo: moto" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Pesados → tipo: caminhao" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Utilitários → tipo: van" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Sucatas → tipo: outro" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Scraper:** API REST (rápido, ~5-10min)" >> $GITHUB_STEP_SUMMARY
-          echo "**Paginação:** Até 100 páginas por categoria" >> $GITHUB_STEP_SUMMARY
-          echo "**Delay:** 1s entre requests" >> $GITHUB_STEP_SUMMARY
+          echo "### ☁️ Destino:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Schema:** auctions" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tabela:** veiculos" >> $GITHUB_STEP_SUMMARY
+          echo "- **Conflict key:** link (URL do lote)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Scraper:** Playwright (Chromium headless)" >> $GITHUB_STEP_SUMMARY
+          echo "**Paginação:** Todas as páginas disponíveis" >> $GITHUB_STEP_SUMMARY
