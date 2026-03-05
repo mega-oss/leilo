@@ -267,6 +267,7 @@ def normalize_to_db(lote: dict, tipo_override: str = None) -> dict | None:
         "imagem_2":              imagens[1] if len(imagens) > 1 else None,
         "imagem_3":              imagens[2] if len(imagens) > 2 else None,
         "percentual_abaixo_fipe": lote.get("desconto_pct"),
+        "margem_revenda":         lote.get("margem_revenda"),
         "km":                    km,
         "origem":                "leilo",
         "ativo":                 True,
@@ -374,6 +375,17 @@ def extract_api_fields(responses: list[dict]) -> dict:
                                        "dataauction", "encerramento"]):
                 if isinstance(v, str) and len(v) > 6:
                     extras.setdefault("data_encerramento_api", v)
+
+            # Imagens via fotosUrls (campo principal da API do leilo)
+            if kl in ("fotosurls", "fotos", "fotosurl", "photos", "images", "imagens"):
+                if isinstance(v, list):
+                    urls_validas = [
+                        u for u in v
+                        if isinstance(u, str) and u.startswith("http")
+                        and not "placeholder" in u and not "logo" in u
+                    ]
+                    if urls_validas and not extras.get("fotos_api"):
+                        extras["fotos_api"] = urls_validas
 
             walk(v, depth + 1)
 
@@ -696,6 +708,17 @@ async def get_lot_detail(page, url: str, net: NetworkCapture,
     # Data encerramento: DOM → API → None
     data_enc = dom.get("data_encerramento") or api.get("data_encerramento_api")
 
+    # Imagens: fotosUrls da API é a fonte primária; DOM como fallback
+    imagens = api.get("fotos_api") or dom.get("imagens") or []
+
+    # Margem de revenda: FIPE - lance - 15k (custo de regularização/lucro mínimo)
+    margem_revenda = None
+    m_fipe  = parse_brl(mercado_raw)
+    m_lance = parse_brl(lance_raw)
+    if m_fipe and m_lance:
+        margem = round(m_fipe - m_lance - 15_000, 2)
+        margem_revenda = margem if margem > 0 else None
+
     return {
         "url":               url,
         "titulo":            dom.get("titulo") or "—",
@@ -705,6 +728,7 @@ async def get_lot_detail(page, url: str, net: NetworkCapture,
         "valor_mercado_raw": parse_brl(mercado_raw),
         "desconto_pct":      desc_pct,
         "desconto_label":    f"{desc_pct}% abaixo do mercado" if desc_pct is not None else "—",
+        "margem_revenda":    margem_revenda,
         "ano":               pares_or_api("Ano", "ano"),
         "km":                pares_or_api("Km", "km"),
         "combustivel":       pares_or_api("Combustivel", "combustivel"),
@@ -713,7 +737,7 @@ async def get_lot_detail(page, url: str, net: NetworkCapture,
         "tipo_retomada":     pares_or_api("Tipo Retomada"),
         "localizacao":       pares_or_api("Localização"),
         "descricao":         dom.get("descricao") or "—",
-        "imagens":           dom.get("imagens") or [],
+        "imagens":           imagens,
         "data_encerramento": data_enc,
     }
 
@@ -790,11 +814,15 @@ async def scrape_categoria(url: str, tipo: str, ctx, args) -> list[dict]:
             lotes.append(lote)
             titulo  = (lote["titulo"] or "")[:50]
             desc    = lote.get("desconto_pct")
+            margem  = lote.get("margem_revenda")
+            n_imgs  = len(lote.get("imagens") or [])
             cor     = GREEN if (desc or 0) >= 30 else YELLOW
+            margem_str = f"  Margem {GREEN}R$ {margem:,.0f}{RESET}" if margem else ""
             print(f"         {YELLOW}{titulo}{RESET}")
             print(f"         Lance {GREEN}{lote['lance']}{RESET}  ·  "
                   f"Mercado {lote['valor_mercado']}  ·  "
-                  f"{cor}{lote['desconto_label']}{RESET}\n")
+                  f"{cor}{lote['desconto_label']}{RESET}"
+                  f"{margem_str}  ·  🖼 {n_imgs} fotos\n")
 
         except Exception as e:
             print(f"         {RED}ERRO: {e}{RESET}\n")
