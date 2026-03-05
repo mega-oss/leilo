@@ -722,8 +722,7 @@ async def get_lot_detail(page, url: str, net: NetworkCapture,
 
 def upload_to_supabase(lotes: list[dict], tipo: str) -> dict:
     """Normaliza e faz upsert dos lotes em auctions.veiculos."""
-    db = SupabaseClient(service_name="leilo-scraper")
-    db.heartbeat_start(metadata={"categoria": tipo, "total_lotes": len(lotes)})
+    db = SupabaseClient()
 
     registros = []
     skipped = 0
@@ -740,7 +739,6 @@ def upload_to_supabase(lotes: list[dict], tipo: str) -> dict:
 
     if not registros:
         print(f"  {RED}Nenhum registro válido para upload.{RESET}")
-        db.heartbeat_error("Nenhum registro válido")
         return {}
 
     print(f"\n{BOLD}{'═'*56}{RESET}")
@@ -748,8 +746,6 @@ def upload_to_supabase(lotes: list[dict], tipo: str) -> dict:
     print(f"{BOLD}{'═'*56}{RESET}\n")
 
     stats = db.upsert_veiculos(registros)
-
-    db.heartbeat_success(final_stats=stats)
 
     print(f"\n  ✅  Inserted/updated: {stats.get('inserted', 0)}")
     print(f"  ❌  Errors:           {stats.get('errors', 0)}")
