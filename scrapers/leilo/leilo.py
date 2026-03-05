@@ -1,22 +1,38 @@
 #!/usr/bin/env python3
 """
-leilo_scraper.py - Extrai lotes do leilo.com.br via passive network listening
+leilo.py — Scraper leilo.com.br + upload direto para auctions.veiculos
 
 Uso:
-    python leilo_scraper.py "https://leilo.com.br/leilao/goiania-goias/carros/..."
-    python leilo_scraper.py "URL" --output resultado.json
-    python leilo_scraper.py "URL" --no-details   # só links, sem entrar em cada lote
-    python leilo_scraper.py "URL" --debug        # dump das respostas da API (diagnóstico)
-    python leilo_scraper.py "URL" --show         # abre janela do browser
+    # Scrapa UMA categoria e manda pro Supabase:
+    python leilo.py "https://leilo.com.br/leilao/brasil/carros"
+
+    # Scrapa TODAS as categorias de veículos:
+    python leilo.py --all
+
+    # Modo debug (sem upload):
+    python leilo.py "URL" --no-upload --debug
+
+    # Só links, sem entrar em cada lote:
+    python leilo.py "URL" --no-details
+
+    # Mostra browser:
+    python leilo.py "URL" --show
 """
 
 import asyncio
 import json
 import re
+import sys
 import argparse
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from playwright.async_api import async_playwright, Response
 
-# ─── Terminal colors ──────────────────────────────────────────────────────────
+# Adiciona scrapers/ ao path para importar supabase_client
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from supabase_client import SupabaseClient
+
+# ─── Cores ────────────────────────────────────────────────────────────────────
 CYAN   = "\033[96m"
 GREEN  = "\033[92m"
 YELLOW = "\033[93m"
@@ -25,24 +41,42 @@ RESET  = "\033[0m"
 BOLD   = "\033[1m"
 DIM    = "\033[2m"
 
+# ─── Mapeamento categoria URL → tipo DB ───────────────────────────────────────
+CATEGORIAS = {
+    "carros":      ("https://leilo.com.br/leilao/carros/de.2018/ate.2026"
+                    "?veiculo.anoModelo=2018%7C2026&veiculo.km=226%7C152908",    "carro"),
+    "motos":       ("https://leilo.com.br/leilao/motos/de.2018/ate.2026"
+                    "?veiculo.anoModelo=2018%7C2026&veiculo.km=226%7C152908",    "moto"),
+    "pesados":     ("https://leilo.com.br/leilao/pesados/de.2018/ate.2026"
+                    "?veiculo.anoModelo=2018%7C2026&veiculo.km=226%7C152908",    "caminhao"),
+    "utilitarios": ("https://leilo.com.br/leilao/utilitarios/de.2018/ate.2026"
+                    "?veiculo.anoModelo=2018%7C2026&veiculo.km=226%7C152908",    "van"),
+    "sucatas":     ("https://leilo.com.br/leilao/sucatas/de.2018/ate.2026"
+                    "?veiculo.anoModelo=2018%7C2026&veiculo.km=226%7C152908",    "sucata"),
+}
+
+
+def _tipo_from_url(url: str) -> str:
+    """Infere o tipo do veículo a partir da URL.
+    Tipos válidos: carro, moto, caminhao, van, maquinario, sucata, outro
+    """
+    u = url.lower()
+    for slug, (_, tipo) in CATEGORIAS.items():
+        if slug in u:
+            return tipo
+    return "outro"
+
+
 # ─── Helpers monetários ───────────────────────────────────────────────────────
 
 def parse_brl(v) -> float | None:
-    """
-    Converte qualquer representação de valor pra float.
-    'R$ 28.900,00' -> 28900.0  |  28900 -> 28900.0  |  'abc' -> None
-    Só aceita valores entre 500 e 5.000.000 (sanidade pra veículos).
-    """
     if v is None:
         return None
     s = str(v).replace("R$", "").replace("\xa0", "").replace(" ", "").strip()
-    # BR: 28.900,00
     if re.match(r"^\d{1,3}(\.\d{3})+(,\d+)?$", s):
         s = s.replace(".", "").replace(",", ".")
-    # Virgula como decimal: 28900,00
     elif re.match(r"^\d+(,\d{1,2})$", s):
         s = s.replace(",", ".")
-    # Remove qualquer separador de milhar restante
     s = s.replace(",", "")
     try:
         val = float(s)
@@ -52,6 +86,7 @@ def parse_brl(v) -> float | None:
         pass
     return None
 
+
 def pct_desconto(lance, mercado) -> float | None:
     l = parse_brl(lance)
     m = parse_brl(mercado)
@@ -59,12 +94,184 @@ def pct_desconto(lance, mercado) -> float | None:
         return round((1 - l / m) * 100, 1)
     return None
 
+
 def fmt_brl(v) -> str:
     val = parse_brl(v)
     if val is None:
         return str(v) if v else "—"
     s = f"{val:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     return f"R$ {s}"
+
+
+# ─── Helpers de parsing ───────────────────────────────────────────────────────
+
+def parse_ano(ano_str: str) -> tuple[int | None, int | None]:
+    """
+    '2019/2020' → (2019, 2020)
+    '2019 2020' → (2019, 2020)
+    '2019'      → (2019, 2019)
+    """
+    if not ano_str or ano_str == "—":
+        return None, None
+    nums = re.findall(r"\d{4}", str(ano_str))
+    if len(nums) >= 2:
+        fab, mod = int(nums[0]), int(nums[1])
+        # sanidade
+        if 1950 <= fab <= 2030 and fab <= mod <= fab + 2:
+            return fab, mod
+    if len(nums) == 1:
+        ano = int(nums[0])
+        if 1950 <= ano <= 2030:
+            return ano, ano
+    return None, None
+
+
+def parse_km(km_str) -> int | None:
+    if not km_str or km_str == "—":
+        return None
+    s = re.sub(r"[^\d]", "", str(km_str))
+    try:
+        val = int(s)
+        return val if 0 <= val <= 2_000_000 else None
+    except Exception:
+        return None
+
+
+def parse_localizacao(loc: str) -> tuple[str | None, str | None]:
+    """
+    'Goiânia - GO' → (estado='GO', cidade='Goiânia')
+    'São Paulo/SP'  → (estado='SP', cidade='São Paulo')
+    """
+    if not loc or loc == "—":
+        return None, None
+    # Tenta padrão "Cidade - UF" ou "Cidade/UF"
+    m = re.search(r"(.+?)\s*[-/]\s*([A-Z]{2})\s*$", loc.strip())
+    if m:
+        return m.group(2).upper(), m.group(1).strip()
+    # Só UF
+    m2 = re.search(r"\b([A-Z]{2})\b", loc)
+    if m2:
+        return m2.group(1), None
+    return None, None
+
+
+def parse_marca_modelo(titulo: str) -> tuple[str | None, str | None]:
+    """
+    Tenta extrair marca e modelo do título do veículo.
+    Heurística simples: primeira palavra maiúscula → marca.
+    """
+    if not titulo or titulo == "—":
+        return None, None
+    partes = titulo.strip().split()
+    if not partes:
+        return None, None
+    marca = partes[0].upper()
+    modelo = " ".join(partes[1:3]) if len(partes) > 1 else None
+    return marca, modelo
+
+
+def parse_data_encerramento(raw: str) -> str | None:
+    """
+    Tenta parsear data do leilão em vários formatos.
+    Retorna ISO 8601 com timezone ou None.
+    """
+    if not raw or raw == "—":
+        return None
+    # Tenta formatos comuns
+    formatos = [
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%Y",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+    ]
+    clean = raw.strip()
+    for fmt in formatos:
+        try:
+            dt = datetime.strptime(clean, fmt)
+            # Assume horário de Brasília (UTC-3)
+            dt_brt = dt.replace(tzinfo=timezone(timedelta(hours=-3)))
+            return dt_brt.isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+# ─── Normalização → schema auctions.veiculos ─────────────────────────────────
+
+def normalize_to_db(lote: dict, tipo_override: str = None) -> dict | None:
+    """
+    Mapeia os campos do scraper para o schema auctions.veiculos.
+    Retorna None se faltarem campos obrigatórios (titulo, valor_inicial, link, ano).
+    """
+    link   = lote.get("url")
+    titulo = lote.get("titulo", "—")
+
+    if not link or not titulo or titulo == "—":
+        return None
+
+    valor_inicial = lote.get("lance_raw")
+    if not valor_inicial:
+        return None
+
+    # Ano
+    ano_fabricacao, ano_modelo = parse_ano(lote.get("ano", "—"))
+    if not ano_fabricacao:
+        # fallback: tenta extrair do titulo
+        m = re.search(r"\b(19[5-9]\d|20[0-3]\d)\b", titulo)
+        if m:
+            ano_fabricacao = ano_modelo = int(m.group(1))
+        else:
+            return None  # NOT NULL no schema
+
+    # Data encerramento (NOT NULL no schema)
+    data_enc = None
+    raw_data = lote.get("data_encerramento")
+    if raw_data:
+        data_enc = parse_data_encerramento(raw_data)
+    if not data_enc:
+        # Fallback: 30 dias no futuro (lote ativo encontrado agora)
+        data_enc = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+
+    # Localização
+    estado, cidade = parse_localizacao(lote.get("localizacao", "—"))
+
+    # Tipo
+    tipo = tipo_override or _tipo_from_url(link)
+
+    # Marca e modelo
+    marca, modelo = parse_marca_modelo(titulo)
+
+    # KM
+    km = parse_km(lote.get("km"))
+
+    # Imagens
+    imagens = lote.get("imagens") or []
+
+    return {
+        "titulo":                titulo,
+        "descricao":             lote.get("descricao") if lote.get("descricao") not in (None, "—") else None,
+        "tipo":                  tipo,
+        "marca":                 marca,
+        "modelo":                modelo,
+        "estado":                estado,
+        "cidade":                cidade,
+        "ano_fabricacao":        ano_fabricacao,
+        "ano_modelo":            ano_modelo,
+        "modalidade":            "leilao",
+        "valor_inicial":         valor_inicial,
+        "valor_atual":           lote.get("lance_raw"),   # mesmo valor — atualizado em tempo real
+        "data_encerramento":     data_enc,
+        "link":                  link,
+        "imagem_1":              imagens[0] if len(imagens) > 0 else None,
+        "imagem_2":              imagens[1] if len(imagens) > 1 else None,
+        "imagem_3":              imagens[2] if len(imagens) > 2 else None,
+        "percentual_abaixo_fipe": lote.get("desconto_pct"),
+        "km":                    km,
+        "origem":                "leilo",
+        "ativo":                 True,
+    }
+
 
 # ─── Passive network capture ─────────────────────────────────────────────────
 
@@ -95,26 +302,21 @@ class NetworkCapture:
     def reset(self):
         self.responses.clear()
 
-# ─── Extração inteligente dos JSONs de API ───────────────────────────────────
 
-# Chaves que NÃO são valores monetários (contadores, IDs, etc.)
+# ─── Extração campos da API ───────────────────────────────────────────────────
+
 _SKIP_SUBSTRINGS = ("id", "uuid", "codigo", "numero", "count", "total",
                     "qtd", "quantidade", "sequence", "posicao", "rank",
                     "historico", "history")
+
 
 def _key_is_noise(key: str) -> bool:
     kl = key.lower().replace("_", "").replace("-", "")
     return any(s in kl for s in _SKIP_SUBSTRINGS)
 
+
 def extract_api_fields(responses: list[dict]) -> dict:
-    """
-    Percorre JSONs capturados extraindo campos com critério:
-    - Valores monetários validados por parse_brl (500–5M)
-    - Chaves de contagem/ID ignoradas
-    - Para lance: prefere chaves explícitas tipo melhorLance/lanceAtual
-    - Para mercado: prefere chaves explícitas tipo valorMercado/fipe
-    """
-    lance_candidates   = []   # (float, chave, valor_original)
+    lance_candidates   = []
     mercado_candidates = []
     extras = {}
 
@@ -131,7 +333,6 @@ def extract_api_fields(responses: list[dict]) -> dict:
         for k, v in obj.items():
             kl = k.lower().replace("_", "").replace("-", "")
 
-            # ── Lance atual ──────────────────────────────────────────────────
             is_lance_key = any(x in kl for x in [
                 "melhorlance", "lancevalor", "valorlance", "lanceatual",
                 "bidvalue", "currentbid", "lastbid", "highestbid",
@@ -141,7 +342,6 @@ def extract_api_fields(responses: list[dict]) -> dict:
                 if val:
                     lance_candidates.append((val, k, v))
 
-            # ── Valor de mercado / FIPE ──────────────────────────────────────
             is_mercado_key = any(x in kl for x in [
                 "valormercado", "valordemercado", "precofipe", "valorefipe",
                 "tabelafipe", "fipevalor", "marketvalue", "marketprice",
@@ -151,28 +351,29 @@ def extract_api_fields(responses: list[dict]) -> dict:
                 if val:
                     mercado_candidates.append((val, k, v))
 
-            # ── KM ──────────────────────────────────────────────────────────
             if kl in ("km", "quilometragem", "odometro", "kilometragem") and not extras.get("km"):
                 try:
                     extras["km"] = int(float(str(v).replace(".", "").replace(",", ".")))
                 except Exception:
                     pass
 
-            # ── Cor ──────────────────────────────────────────────────────────
             if kl in ("cor", "cordo", "corveiculo") and isinstance(v, str) and 2 < len(v) < 30:
                 extras.setdefault("cor", v)
 
-            # ── Combustível ──────────────────────────────────────────────────
             if ("combustivel" in kl or "fuel" in kl) and isinstance(v, str) and len(v) < 30:
                 extras.setdefault("combustivel", v)
 
-            # ── Ano ──────────────────────────────────────────────────────────
             if kl in ("anomodelo", "anofabricacao", "modelyear") and isinstance(v, (int, str)):
                 extras.setdefault("ano", str(v))
 
-            # ── Placa ────────────────────────────────────────────────────────
             if "placa" in kl and isinstance(v, str) and 5 < len(v) < 12:
                 extras.setdefault("placa", v)
+
+            # Data encerramento via API
+            if any(x in kl for x in ["dataencerramento", "datafim", "enddate", "dtfim",
+                                       "dataauction", "encerramento"]):
+                if isinstance(v, str) and len(v) > 6:
+                    extras.setdefault("data_encerramento_api", v)
 
             walk(v, depth + 1)
 
@@ -181,23 +382,22 @@ def extract_api_fields(responses: list[dict]) -> dict:
 
     result = dict(extras)
 
-    # Lance: o maior candidato (lance mais alto = mais recente)
     if lance_candidates:
         lance_candidates.sort(key=lambda x: x[0], reverse=True)
         result["lance"] = lance_candidates[0][2]
 
-    # Mercado: o maior candidato (valor de tabela)
     if mercado_candidates:
         mercado_candidates.sort(key=lambda x: x[0], reverse=True)
         result["valor_mercado"] = mercado_candidates[0][2]
 
     return result
 
-# ─── Extração DOM ────────────────────────────────────────────────────────────
+
+# ─── DOM JS (inclui imagens e data de encerramento) ───────────────────────────
 
 DOM_JS = """
 () => {
-    const out = { pares: {}, rValues: [] };
+    const out = { pares: {}, rValues: [], imagens: [] };
 
     // Título
     out.titulo = (
@@ -205,7 +405,7 @@ DOM_JS = """
         document.querySelector('[class*="titulo-veiculo"]')?.innerText || ''
     ).trim().replace(/\\s+/g, ' ');
 
-    // Pares label → valor (seção categorias)
+    // Pares label → valor
     document.querySelectorAll('[class*="label-categoria"]').forEach(label => {
         const col = label.closest('[class*="col-"]');
         if (!col) return;
@@ -215,7 +415,7 @@ DOM_JS = """
         if (k && v && k !== v && v.length < 200) out.pares[k] = v;
     });
 
-    // Todos os valores monetários visíveis na página (folhas do DOM)
+    // Valores monetários visíveis
     const seen = new Set();
     document.querySelectorAll('*').forEach(el => {
         if (el.children.length > 0) return;
@@ -223,14 +423,11 @@ DOM_JS = """
         if (!t || seen.has(t)) return;
         seen.add(t);
         if (/R\\$\\s*[\\d,.]+/.test(t)) {
-            out.rValues.push({
-                text: t,
-                cls: typeof el.className === 'string' ? el.className : ''
-            });
+            out.rValues.push({ text: t, cls: typeof el.className === 'string' ? el.className : '' });
         }
     });
 
-    // Lance: seletores específicos
+    // Lance atual
     const lanceSelectors = [
         '[class*="lance-atual"]','[class*="lanceAtual"]','[class*="melhor-lance"]',
         '[class*="melhorLance"]','[class*="valor-lance"]','[class*="bid"]',
@@ -238,13 +435,46 @@ DOM_JS = """
     ];
     for (const s of lanceSelectors) {
         const el = document.querySelector(s);
-        if (el && /R\\$/.test(el.innerText)) {
-            out.lance_dom = el.innerText.trim();
-            break;
+        if (el && /R\\$/.test(el.innerText)) { out.lance_dom = el.innerText.trim(); break; }
+    }
+
+    // Data de encerramento
+    const dataSelectors = [
+        '[class*="encerramento"]','[class*="data-fim"]','[class*="countdown"]',
+        '[class*="timer"]','[data-cy*="encerramento"]','[class*="prazo"]',
+        '[class*="data-leilao"]','[class*="auction-date"]'
+    ];
+    for (const s of dataSelectors) {
+        const el = document.querySelector(s);
+        if (el) {
+            const t = el.getAttribute('data-date') || el.getAttribute('datetime') || el.innerText;
+            if (t && t.trim().length > 4) { out.data_encerramento = t.trim(); break; }
         }
     }
 
-    // Lote número
+    // Imagens do veículo
+    const imgSelectors = [
+        '[class*="foto-veiculo"] img',
+        '[class*="galeria"] img',
+        '[class*="carousel"] img',
+        '[class*="slider"] img',
+        '[class*="vehicle-image"] img',
+        '.q-carousel img',
+    ];
+    const imgSeen = new Set();
+    for (const s of imgSelectors) {
+        document.querySelectorAll(s).forEach(img => {
+            const src = img.src || img.dataset.src || '';
+            if (src && !imgSeen.has(src) && !src.includes('placeholder')
+                     && !src.includes('logo') && src.startsWith('http')) {
+                imgSeen.add(src);
+                out.imagens.push(src);
+            }
+        });
+        if (out.imagens.length >= 3) break;
+    }
+
+    // Lote
     out.num_lote = (
         document.querySelector('[class*="num-lote"]')?.innerText ||
         document.querySelector('[class*="numero-lote"]')?.innerText || ''
@@ -260,20 +490,16 @@ DOM_JS = """
 }
 """
 
-# ─── Listagem ─────────────────────────────────────────────────────────────────
-
+# ─── Listagem (paginação Quasar) ──────────────────────────────────────────────
 
 async def _get_uuid_links(page) -> list[str]:
-    """Coleta links UUID no DOM sem scroll."""
     return await page.evaluate("""
         () => {
             const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
-            const seen = new Set();
-            const out = [];
+            const seen = new Set(); const out = [];
             document.querySelectorAll('a[href]').forEach(a => {
                 if (UUID.test(a.href) && !seen.has(a.href)) {
-                    seen.add(a.href);
-                    out.push(a.href);
+                    seen.add(a.href); out.push(a.href);
                 }
             });
             return out;
@@ -281,23 +507,7 @@ async def _get_uuid_links(page) -> list[str]:
     """)
 
 
-async def _max_visible_page(page) -> int:
-    """Maior número de página visível nos botões da paginação."""
-    return await page.evaluate("""
-        () => {
-            const btns = document.querySelectorAll('.q-pagination button[aria-label]');
-            let max = 1;
-            btns.forEach(b => {
-                const n = parseInt(b.getAttribute('aria-label'), 10);
-                if (!isNaN(n) && n > max) max = n;
-            });
-            return max;
-        }
-    """)
-
-
 async def _next_btn_enabled(page) -> bool:
-    """Verifica se o botão > (next) do Quasar está habilitado."""
     return await page.evaluate("""
         () => {
             const pg = document.querySelector('.q-pagination');
@@ -312,7 +522,6 @@ async def _next_btn_enabled(page) -> bool:
 
 
 async def _click_page_btn(page, pg_num: int) -> bool:
-    """Clica no botão numérico pg_num se estiver visível."""
     return await page.evaluate(
         "(n) => {"
         "  const btns = document.querySelectorAll('.q-pagination button[aria-label]');"
@@ -328,7 +537,6 @@ async def _click_page_btn(page, pg_num: int) -> bool:
 
 
 async def _click_next_arrow(page) -> bool:
-    """Clica na seta > para avançar a janela de páginas."""
     return await page.evaluate("""
         () => {
             const pg = document.querySelector('.q-pagination');
@@ -346,12 +554,9 @@ async def _click_next_arrow(page) -> bool:
 
 
 async def _wait_for_page(page, pg_num: int):
-    """Aguarda o Quasar confirmar que a página pg_num está ativa."""
     try:
         await page.wait_for_function(
             "(n) => {"
-            "  const b = document.querySelector('.q-pagination button[aria-label]');"
-            "  if (!b) return false;"
             "  const all = document.querySelectorAll('.q-pagination button[aria-label]');"
             "  for (const btn of all) {"
             "    if (parseInt(btn.getAttribute('aria-label'),10) === n"
@@ -368,9 +573,7 @@ async def _wait_for_page(page, pg_num: int):
     await asyncio.sleep(0.6)
 
 
-async def _collect_page_links(page, seen: set, all_links: list, pg_num: int) -> int:
-    """Scroll leve + coleta links novos da página atual."""
-    # Volta ao topo — essencial para o Quasar re-renderizar os cards
+async def _collect_page_links(page, seen: set, all_links: list) -> int:
     await page.evaluate("window.scrollTo(0, 0)")
     await asyncio.sleep(0.4)
     for _ in range(4):
@@ -400,83 +603,72 @@ async def get_lot_links(page, url: str) -> list[str]:
 
     while True:
         print(f"  {CYAN}📄 Coletando página {pg_num}...{RESET}")
-        new_count = await _collect_page_links(page, seen, all_links, pg_num)
+        new_count = await _collect_page_links(page, seen, all_links)
         print(f"  {DIM}  +{new_count} novos links (total: {len(all_links)}){RESET}")
 
-        # Checa se há próxima página
         if not await _next_btn_enabled(page):
-            print(f"  {DIM}Última página alcançada ({pg_num}).{RESET}")
+            print(f"  {DIM}Última página ({pg_num}).{RESET}")
             break
 
         pg_num += 1
-
-        # Tenta clicar direto no botão numérico (pode não estar visível
-        # se a janela de paginação ainda não avançou)
         clicked = await _click_page_btn(page, pg_num)
         if not clicked:
-            # Botão não visível: avança a janela clicando na seta >
             await _click_next_arrow(page)
             await asyncio.sleep(0.8)
             await page.wait_for_load_state("networkidle")
-            # Agora tenta o botão numérico novamente
             clicked = await _click_page_btn(page, pg_num)
 
         if not clicked:
-            # Não foi possível navegar — usa só a seta e coleta o que vier
             print(f"  {DIM}Navegando via seta para pág {pg_num}...{RESET}")
 
         await _wait_for_page(page, pg_num)
 
     return all_links
 
+
 # ─── Detalhe do lote ──────────────────────────────────────────────────────────
 
-async def get_lot_detail(page, url: str, net: NetworkCapture, debug: bool = False) -> dict:
+async def get_lot_detail(page, url: str, net: NetworkCapture,
+                         debug: bool = False) -> dict:
     net.reset()
     net.attach(page)
 
     await page.goto(url, wait_until="networkidle", timeout=60000)
     await asyncio.sleep(1.2)
 
-    dom  = await page.evaluate(DOM_JS)
-    api  = extract_api_fields(net.responses)
+    dom = await page.evaluate(DOM_JS)
+    api = extract_api_fields(net.responses)
 
     if debug:
-        print(f"\n  {DIM}── DEBUG ──────────────────────────────────────────{RESET}")
+        print(f"\n  {DIM}── DEBUG ─────────────────────────────────────────{RESET}")
         print(f"  {DIM}API responses: {len(net.responses)}{RESET}")
-        for r in net.responses:
+        for r in net.responses[:3]:
             print(f"  {DIM}  {r['url']}")
-            print(f"       {json.dumps(r['data'], ensure_ascii=False)[:400]}{RESET}")
+            print(f"       {json.dumps(r['data'], ensure_ascii=False)[:300]}{RESET}")
         print(f"  {DIM}API extraído: {api}{RESET}")
         print(f"  {DIM}DOM pares:    {dom.get('pares')}{RESET}")
-        print(f"  {DIM}rValues:      {dom.get('rValues', [])[:8]}{RESET}")
         print()
 
     net.detach(page)
     pares = dom.get("pares") or {}
 
-    # ── Lance ─────────────────────────────────────────────────────────────────
-    # API é a melhor fonte pra lance (não aparece com label fixo no DOM)
+    # Lance
     lance_raw = api.get("lance") or dom.get("lance_dom")
-
     if not lance_raw:
-        # Fallback: menor R$ válido na página com pelo menos 2 valores distintos
-        vals = sorted([parse_brl(r["text"]) for r in dom.get("rValues", []) if parse_brl(r["text"])])
+        vals = sorted([parse_brl(r["text"]) for r in dom.get("rValues", [])
+                       if parse_brl(r["text"])])
         if len(vals) >= 2:
             lance_raw = vals[0]
-        # Se só 1 valor, não arrisca (pode ser o mercado)
 
-    # ── Mercado ───────────────────────────────────────────────────────────────
-    # DOM pares TEM PRIORIDADE — "Valor Mercado" está explicitamente rotulado na página
+    # Mercado
     mercado_pares = parse_brl(pares.get("Valor Mercado"))
     mercado_api   = parse_brl(api.get("valor_mercado"))
-
-    # Sanidade: mercado deve ser > lance e < lance * 20 (desconto real máximo ~95%)
     lance_f = parse_brl(lance_raw)
+
     def mercado_ok(m):
         if not m: return False
-        if lance_f and m < lance_f: return False          # mercado < lance → absurdo
-        if lance_f and m > lance_f * 20: return False     # > 2000% de desconto → lixo
+        if lance_f and m < lance_f: return False
+        if lance_f and m > lance_f * 20: return False
         return True
 
     if mercado_pares and mercado_ok(mercado_pares):
@@ -484,184 +676,223 @@ async def get_lot_detail(page, url: str, net: NetworkCapture, debug: bool = Fals
     elif mercado_api and mercado_ok(mercado_api):
         mercado_raw = mercado_api
     else:
-        # Último fallback: maior R$ razoável na página
         vals = sorted(
-            [parse_brl(r["text"]) for r in dom.get("rValues", []) if mercado_ok(parse_brl(r["text"]))],
-            reverse=True
+            [parse_brl(r["text"]) for r in dom.get("rValues", [])
+             if mercado_ok(parse_brl(r["text"]))],
+            reverse=True,
         )
         mercado_raw = vals[0] if vals else (mercado_pares or mercado_api)
 
-    # ── Campos do veículo — DOM pares tem prioridade (são os valores exibidos) ──
     def pares_or_api(pares_key, api_key=None):
         v = pares.get(pares_key)
         if v and v != "—":
-            # Limpa texto de ícones Material que vaza junto
-            v = re.sub(r'\s*(info_outline|info|warning|error)\s*$', '', v, flags=re.I).strip()
+            v = re.sub(r'\s*(info_outline|info|warning|error)\s*$', '',
+                       v, flags=re.I).strip()
             return v or "—"
         return (api.get(api_key) if api_key else None) or "—"
 
-    # Desconto
     desc_pct = pct_desconto(lance_raw, mercado_raw)
 
+    # Data encerramento: DOM → API → None
+    data_enc = dom.get("data_encerramento") or api.get("data_encerramento_api")
+
     return {
-        "url": url,
-        "titulo": dom.get("titulo") or "—",
-        "lance": fmt_brl(lance_raw) if lance_raw else "—",
-        "lance_raw": parse_brl(lance_raw),
-        "valor_mercado": fmt_brl(mercado_raw) if mercado_raw else "—",
+        "url":               url,
+        "titulo":            dom.get("titulo") or "—",
+        "lance":             fmt_brl(lance_raw) if lance_raw else "—",
+        "lance_raw":         parse_brl(lance_raw),
+        "valor_mercado":     fmt_brl(mercado_raw) if mercado_raw else "—",
         "valor_mercado_raw": parse_brl(mercado_raw),
-        "desconto_pct": desc_pct,
-        "desconto_label": f"{desc_pct}% abaixo do mercado" if desc_pct is not None else "—",
-        # Dados do veículo — pares DOM sempre preferido
-        "ano":             pares_or_api("Ano", "ano"),
-        "km":              pares_or_api("Km", "km"),
-        "combustivel":     pares_or_api("Combustivel", "combustivel"),
-        "cor":             pares_or_api("Cor", "cor"),
-        "chave":           pares_or_api("Possui Chave"),
-        "tipo_retomada":   pares_or_api("Tipo Retomada"),
-        "localizacao":     pares_or_api("Localização"),
-        "prazo_documentacao": pares_or_api("Prazo est. documentação"),
-        "descricao":       dom.get("descricao") or "—",
+        "desconto_pct":      desc_pct,
+        "desconto_label":    f"{desc_pct}% abaixo do mercado" if desc_pct is not None else "—",
+        "ano":               pares_or_api("Ano", "ano"),
+        "km":                pares_or_api("Km", "km"),
+        "combustivel":       pares_or_api("Combustivel", "combustivel"),
+        "cor":               pares_or_api("Cor", "cor"),
+        "chave":             pares_or_api("Possui Chave"),
+        "tipo_retomada":     pares_or_api("Tipo Retomada"),
+        "localizacao":       pares_or_api("Localização"),
+        "descricao":         dom.get("descricao") or "—",
+        "imagens":           dom.get("imagens") or [],
+        "data_encerramento": data_enc,
     }
 
-# ─── Main ──────────────────────────────────────────────────────────────────────
+
+# ─── Upload para Supabase ─────────────────────────────────────────────────────
+
+def upload_to_supabase(lotes: list[dict], tipo: str) -> dict:
+    """Normaliza e faz upsert dos lotes em auctions.veiculos."""
+    db = SupabaseClient(service_name="leilo-scraper")
+    db.heartbeat_start(metadata={"categoria": tipo, "total_lotes": len(lotes)})
+
+    registros = []
+    skipped = 0
+
+    for lote in lotes:
+        rec = normalize_to_db(lote, tipo_override=tipo)
+        if rec:
+            registros.append(rec)
+        else:
+            skipped += 1
+
+    if skipped:
+        print(f"  {YELLOW}⚠️  {skipped} lote(s) ignorado(s) (campos obrigatórios ausentes){RESET}")
+
+    if not registros:
+        print(f"  {RED}Nenhum registro válido para upload.{RESET}")
+        db.heartbeat_error("Nenhum registro válido")
+        return {}
+
+    print(f"\n{BOLD}{'═'*56}{RESET}")
+    print(f"{BOLD}  ☁️   UPLOAD → auctions.veiculos  ({len(registros)} registros){RESET}")
+    print(f"{BOLD}{'═'*56}{RESET}\n")
+
+    stats = db.upsert_veiculos(registros)
+
+    db.heartbeat_success(final_stats=stats)
+
+    print(f"\n  ✅  Inserted/updated: {stats.get('inserted', 0)}")
+    print(f"  ❌  Errors:           {stats.get('errors', 0)}")
+    print(f"  🔄  Dupes removidas:  {stats.get('duplicates_removed', 0)}")
+
+    return stats
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+async def scrape_categoria(url: str, tipo: str, ctx, args) -> list[dict]:
+    """Scrapa uma categoria e retorna os lotes coletados."""
+    net = NetworkCapture()
+    page_list = await ctx.new_page()
+    lot_links = await get_lot_links(page_list, url)
+    lot_links = list(dict.fromkeys(lot_links))[:args.max]
+    await page_list.close()
+
+    print(f"{GREEN}  ✅ {len(lot_links)} lotes encontrados em {url}{RESET}\n")
+
+    if not lot_links:
+        print(f"{RED}  ⚠️  Nenhum lote. Tente --show (pode ter captcha).{RESET}\n")
+        return []
+
+    if args.no_details:
+        return [{"url": lnk} for lnk in lot_links]
+
+    page_det = await ctx.new_page()
+    lotes = []
+    skipped = 0
+
+    for i, link in enumerate(lot_links, 1):
+        print(f"  {DIM}[{i:>3}/{len(lot_links)}]{RESET} ...{link[-50:]}")
+        try:
+            lote = await get_lot_detail(page_det, link, net, debug=args.debug)
+
+            if not lote.get("lance_raw"):
+                skipped += 1
+                print(f"         {DIM}⏭  sem lance ativo — ignorado{RESET}\n")
+                continue
+
+            lotes.append(lote)
+            titulo  = (lote["titulo"] or "")[:50]
+            desc    = lote.get("desconto_pct")
+            cor     = GREEN if (desc or 0) >= 30 else YELLOW
+            print(f"         {YELLOW}{titulo}{RESET}")
+            print(f"         Lance {GREEN}{lote['lance']}{RESET}  ·  "
+                  f"Mercado {lote['valor_mercado']}  ·  "
+                  f"{cor}{lote['desconto_label']}{RESET}\n")
+
+        except Exception as e:
+            print(f"         {RED}ERRO: {e}{RESET}\n")
+            lotes.append({"url": link, "erro": str(e)})
+
+    if skipped:
+        print(f"  {DIM}⏭  {skipped} lote(s) ignorado(s) — sem lance ativo{RESET}\n")
+
+    await page_det.close()
+    return lotes
+
 
 async def main():
-    parser = argparse.ArgumentParser(description="Scraper leilo.com.br v2")
-    parser.add_argument("url", help="URL da listagem")
+    parser = argparse.ArgumentParser(description="Leilo scraper → auctions.veiculos")
+    parser.add_argument("--url", help="URL de uma categoria específica")
+    parser.add_argument("--all", action="store_true",
+                        help="Scrapa todas as categorias de veículos")
     parser.add_argument("--output", "-o", default="lotes.json")
     parser.add_argument("--no-details", action="store_true", help="Só links")
-    parser.add_argument("--show", action="store_true", help="Janela do browser visível")
-    parser.add_argument("--debug", action="store_true", help="Dump das respostas de API")
-    parser.add_argument("--max", type=int, default=999, help="Máx de lotes")
+    parser.add_argument("--no-upload", action="store_true",
+                        help="Não envia para o Supabase (debug local)")
+    parser.add_argument("--show", action="store_true", help="Janela do browser")
+    parser.add_argument("--debug", action="store_true", help="Dump das respostas API")
+    parser.add_argument("--max", type=int, default=999, help="Máx de lotes por categoria")
     args = parser.parse_args()
 
+    if not args.url and not args.all:
+        parser.error("Informe --url <URL> ou use --all para todas as categorias.")
+
+    # Monta lista de (url, tipo)
+    if args.all:
+        targets = [(url, tipo) for _, (url, tipo) in CATEGORIAS.items()]
+    else:
+        targets = [(args.url, _tipo_from_url(args.url))]
+
     print(f"\n{BOLD}{'═'*64}{RESET}")
-    print(f"{BOLD}  🚗  LEILO SCRAPER  v2{RESET}")
+    print(f"{BOLD}  🚗  LEILO SCRAPER → auctions.veiculos{RESET}")
     print(f"{BOLD}{'═'*64}{RESET}")
-    print(f"  {DIM}{args.url}{RESET}\n")
+    print(f"  {DIM}{len(targets)} categoria(s) | upload: {'não' if args.no_upload else 'sim'}{RESET}\n")
+
+    todos_lotes: list[dict] = []
+    stats_total = {'inserted': 0, 'errors': 0, 'duplicates_removed': 0}
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=not args.show)
         ctx = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 Chrome/122 Safari/537.36",
             viewport={"width": 1280, "height": 900},
             locale="pt-BR",
         )
-        net = NetworkCapture()
 
-        # ── Listagem ──────────────────────────────────────────────────────────
-        page_list = await ctx.new_page()
-        lot_links = await get_lot_links(page_list, args.url)
-        lot_links = list(dict.fromkeys(lot_links))[:args.max]
+        for cat_url, tipo in targets:
+            print(f"\n{BOLD}{'─'*64}{RESET}")
+            print(f"{BOLD}  📂  Categoria: {tipo.upper()} — {cat_url}{RESET}")
+            print(f"{BOLD}{'─'*64}{RESET}")
 
-        print(f"{GREEN}  ✅ {len(lot_links)} lotes encontrados{RESET}\n")
+            lotes = await scrape_categoria(cat_url, tipo, ctx, args)
 
-        if not lot_links:
-            print(f"{RED}  ⚠️  Nenhum lote. Tente --show (pode ter captcha).{RESET}\n")
-            await browser.close()
-            return
+            if lotes:
+                todos_lotes.extend(lotes)
 
-        if args.no_details:
-            out = {"listagem_url": args.url, "total": len(lot_links), "links": lot_links}
-            with open(args.output, "w", encoding="utf-8") as f:
-                json.dump(out, f, ensure_ascii=False, indent=2)
-            print(f"{GREEN}  💾 Salvo: {args.output}{RESET}\n")
-            await browser.close()
-            return
-
-        # ── Detalhe de cada lote ──────────────────────────────────────────────
-        page_det = await ctx.new_page()
-        lotes = []
-        skipped = 0
-
-        for i, link in enumerate(lot_links, 1):
-            print(f"  {DIM}[{i:>3}/{len(lot_links)}]{RESET} ...{link[-50:]}")
-            try:
-                lote = await get_lot_detail(page_det, link, net, debug=args.debug)
-
-                # Sem lance ativo (encerrado/offline) — ignora
-                if not lote.get("lance_raw"):
-                    skipped += 1
-                    print(f"         {DIM}⏭  sem lance ativo — ignorado{RESET}\n")
-                    continue
-
-                lotes.append(lote)
-                titulo = (lote["titulo"] or "")[:50]
-                desc_pct = lote.get("desconto_pct")
-                cor = GREEN if (desc_pct or 0) >= 30 else YELLOW
-                print(f"         {YELLOW}{titulo}{RESET}")
-                print(f"         Lance {GREEN}{lote['lance']}{RESET}  ·  "
-                      f"Mercado {lote['valor_mercado']}  ·  "
-                      f"{cor}{lote['desconto_label']}{RESET}\n")
-
-            except Exception as e:
-                print(f"         {RED}ERRO: {e}{RESET}\n")
-                lotes.append({"url": link, "erro": str(e)})
-
-        if skipped:
-            print(f"  {DIM}⏭  {skipped} lote(s) ignorado(s) — sem lance ativo{RESET}\n")
+                if not args.no_upload:
+                    stats = upload_to_supabase(lotes, tipo)
+                    for k in ('inserted', 'errors', 'duplicates_removed'):
+                        stats_total[k] = stats_total.get(k, 0) + stats.get(k, 0)
 
         await browser.close()
 
-        # ── Ordenar e salvar ──────────────────────────────────────────────────
-        com = sorted([l for l in lotes if isinstance(l.get("desconto_pct"), float)],
-                     key=lambda x: x["desconto_pct"], reverse=True)
-        sem = [l for l in lotes if not isinstance(l.get("desconto_pct"), float)]
+    # Salva JSON local
+    com = sorted([l for l in todos_lotes if isinstance(l.get("desconto_pct"), float)],
+                 key=lambda x: x["desconto_pct"], reverse=True)
+    sem = [l for l in todos_lotes if not isinstance(l.get("desconto_pct"), float)]
 
-        output = {
-            "listagem_url": args.url,
-            "total_lotes": len(lotes),
-            "com_desconto_calculado": len(com),
-            "melhor_desconto": com[0] if com else None,
-            "lotes": com + sem,
-        }
+    output = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "total_lotes": len(todos_lotes),
+        "com_desconto": len(com),
+        "lotes": com + sem,
+    }
+    with open(args.output, "w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
 
-        with open(args.output, "w", encoding="utf-8") as f:
-            json.dump(output, f, ensure_ascii=False, indent=2)
+    # Resumo final
+    print(f"\n{BOLD}{'═'*64}{RESET}")
+    print(f"{BOLD}  📊  RESUMO FINAL{RESET}")
+    print(f"{BOLD}{'═'*64}{RESET}")
+    print(f"  Total lotes coletados: {len(todos_lotes)}")
+    print(f"  Com desconto calculado: {len(com)}")
+    if not args.no_upload:
+        print(f"  Enviados ao Supabase:   {stats_total['inserted']}")
+        print(f"  Erros:                  {stats_total['errors']}")
+    print(f"  JSON local: {args.output}\n")
 
-        # ── Ranking final ─────────────────────────────────────────────────────
-        rank_lines = []
-        rank_lines.append(f"{'#':<3}  {'%':>6}  {'Lance':>14}  {'Mercado':>14}  {'Veículo':<42}  URL")
-        rank_lines.append("─" * 130)
-
-        for j, l in enumerate(com, 1):
-            pct_s  = f"{l['desconto_pct']:.1f}%"
-            lance  = l.get('lance', '—')
-            merc   = l.get('valor_mercado', '—')
-            titulo = (l.get('titulo') or '—')[:42]
-            url    = l['url']
-            rank_lines.append(f"{j:<3}  {pct_s:>6}  {lance:>14}  {merc:>14}  {titulo:<42}  {url}")
-
-        # Erros no final
-        if sem:
-            rank_lines.append("")
-            rank_lines.append(f"── Sem desconto calculado ({len(sem)}) ──")
-            for l in sem:
-                rank_lines.append(f"     {l.get('titulo','—')}  {l['url']}")
-
-        # Printa no terminal
-        print(f"\n{BOLD}{'═'*64}{RESET}")
-        print(f"{BOLD}  📊  RANKING — {len(com)} lotes, maior → menor desconto{RESET}")
-        print(f"{BOLD}{'═'*64}{RESET}\n")
-        for line in rank_lines:
-            # Colore a % dependendo do valor
-            if line and line[0].isdigit():
-                pct_val = float(line.split('%')[0].split()[-1]) if '%' in line else 0
-                cor = GREEN if pct_val >= 50 else (YELLOW if pct_val >= 35 else RESET)
-                print(f"  {cor}{line}{RESET}")
-            else:
-                print(f"  {DIM}{line}{RESET}")
-
-        # Salva rank.txt
-        rank_file = args.output.replace(".json", "_rank.txt")
-        with open(rank_file, "w", encoding="utf-8") as f:
-            f.write(f"LEILO RANK — {args.url}\n\n")
-            f.write("\n".join(rank_lines))
-            f.write("\n")
-
-        print(f"\n  {GREEN}💾 JSON:  {args.output}{RESET}")
-        print(f"  {GREEN}📋 Rank:  {rank_file}{RESET}\n")
 
 if __name__ == "__main__":
     asyncio.run(main())
