@@ -314,13 +314,72 @@ _SKIP_SUBSTRINGS = ("id", "uuid", "codigo", "numero", "count", "total",
                     "qtd", "quantidade", "sequence", "posicao", "rank",
                     "historico", "history")
 
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I
+)
+
+_FOTO_KEYS = {"fotosurls", "fotos", "fotosurl", "photos", "images", "imagens"}
+
+
+def _find_fotos_for_uuid(obj, lot_uuid: str, depth=0) -> list[str] | None:
+    """
+    Percorre o JSON recursivamente e retorna as fotos do objeto que
+    contém o UUID do lote atual. Resolve o bug do busca-elastic que
+    retorna todos os lotes num único array — cada item tem seu UUID
+    e seu fotosUrls, então buscamos pelo UUID certo dentro dos dados.
+    """
+    if depth > 10 or not lot_uuid:
+        return None
+    if isinstance(obj, list):
+        for item in obj:
+            r = _find_fotos_for_uuid(item, lot_uuid, depth + 1)
+            if r is not None:
+                return r
+        return None
+    if not isinstance(obj, dict):
+        return None
+
+    # Verifica se este objeto contém o UUID em algum valor string
+    has_uuid = any(
+        isinstance(v, str) and lot_uuid.lower() in v.lower()
+        for v in obj.values()
+    )
+    if has_uuid:
+        # Procura fotosUrls diretamente neste objeto
+        for k, v in obj.items():
+            if k.lower().replace("_", "").replace("-", "") in _FOTO_KEYS:
+                if isinstance(v, list):
+                    urls = [u for u in v if isinstance(u, str)
+                            and u.startswith("http")
+                            and "placeholder" not in u and "logo" not in u]
+                    if urls:
+                        return urls
+        # UUID aqui mas sem fotos diretas — desce nos filhos
+        for v in obj.values():
+            r = _find_fotos_for_uuid(v, lot_uuid, depth + 1)
+            if r is not None:
+                return r
+        return None
+
+    # Sem UUID neste nível — desce
+    for v in obj.values():
+        r = _find_fotos_for_uuid(v, lot_uuid, depth + 1)
+        if r is not None:
+            return r
+    return None
+
 
 def _key_is_noise(key: str) -> bool:
     kl = key.lower().replace("_", "").replace("-", "")
     return any(s in kl for s in _SKIP_SUBSTRINGS)
 
 
-def extract_api_fields(responses: list[dict]) -> dict:
+def extract_api_fields(responses: list[dict], lot_uuid: str | None = None) -> dict:
+    """
+    Extrai campos da API. Se lot_uuid for fornecido, busca as fotos
+    especificamente no objeto que corresponde a esse lote dentro de
+    respostas batch (ex: busca-elastic com múltiplos lotes).
+    """
     lance_candidates   = []
     mercado_candidates = []
     extras = {}
@@ -404,6 +463,19 @@ def extract_api_fields(responses: list[dict]) -> dict:
         walk(cap["data"])
 
     result = dict(extras)
+
+    # Fotos: se tiver UUID do lote, procura especificamente o objeto desse lote
+    # dentro de todas as respostas (resolve o bug do busca-elastic batch).
+    # Só usa a extração genérica (maior conjunto) se não encontrar pelo UUID.
+    if lot_uuid:
+        fotos_por_uuid = None
+        for cap in responses:
+            fotos_por_uuid = _find_fotos_for_uuid(cap["data"], lot_uuid)
+            if fotos_por_uuid:
+                break
+        if fotos_por_uuid:
+            result["fotos_api"] = fotos_por_uuid
+        # se não achou pelo UUID, mantém o que o walk encontrou (fallback)
 
     if lance_candidates:
         lance_candidates.sort(key=lambda x: x[0], reverse=True)
@@ -674,7 +746,7 @@ async def get_lot_detail(page, url: str, net: NetworkCapture,
     else:
         responses_to_use = net.responses
 
-    api = extract_api_fields(responses_to_use)
+    api = extract_api_fields(responses_to_use, lot_uuid=lot_uuid)
 
     if debug:
         print(f"\n  {DIM}── DEBUG ─────────────────────────────────────────{RESET}")
