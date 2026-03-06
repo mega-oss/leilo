@@ -525,16 +525,21 @@ def extract_api_fields(responses: list[dict]) -> dict:
                 if isinstance(v, str) and len(v) > 6:
                     extras.setdefault("data_encerramento_api", v)
 
-            # Imagens via fotosUrls (campo principal da API do leilo)
+            # Imagens via fotosUrls (campo principal da API do leilo).
+            # Coleta TODOS os candidatos e usa o MAIOR conjunto encontrado —
+            # evita que uma resposta de listagem (fotos de outros lotes)
+            # sobrescreva as fotos corretas do lote atual.
             if kl in ("fotosurls", "fotos", "fotosurl", "photos", "images", "imagens"):
                 if isinstance(v, list):
                     urls_validas = [
                         u for u in v
                         if isinstance(u, str) and u.startswith("http")
-                        and not "placeholder" in u and not "logo" in u
+                        and "placeholder" not in u and "logo" not in u
                     ]
-                    if urls_validas and not extras.get("fotos_api"):
-                        extras["fotos_api"] = urls_validas
+                    if urls_validas:
+                        current = extras.get("fotos_api") or []
+                        if len(urls_validas) > len(current):
+                            extras["fotos_api"] = urls_validas
 
             walk(v, depth + 1)
 
@@ -798,12 +803,29 @@ async def get_lot_detail(page, url: str, net: NetworkCapture,
     await asyncio.sleep(1.2)
 
     dom = await page.evaluate(DOM_JS)
-    api = extract_api_fields(net.responses)
+
+    # Extrai o UUID do lote a partir da URL para filtrar respostas de rede.
+    # Evita que respostas de listagem/recomendações (com fotos de OUTROS lotes)
+    # contaminem as fotos do lote atual.
+    lot_uuid_match = re.search(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", url, re.I
+    )
+    lot_uuid = lot_uuid_match.group(0).lower() if lot_uuid_match else None
+
+    # Prioridade: respostas cujo URL contém o UUID do lote atual.
+    # Fallback: todas as respostas (comportamento anterior).
+    if lot_uuid:
+        specific = [r for r in net.responses if lot_uuid in r["url"].lower()]
+        responses_to_use = specific if specific else net.responses
+    else:
+        responses_to_use = net.responses
+
+    api = extract_api_fields(responses_to_use)
 
     if debug:
         print(f"\n  {DIM}── DEBUG ─────────────────────────────────────────{RESET}")
-        print(f"  {DIM}API responses: {len(net.responses)}{RESET}")
-        for r in net.responses[:3]:
+        print(f"  {DIM}API responses total: {len(net.responses)} | usadas: {len(responses_to_use)}{RESET}")
+        for r in responses_to_use[:3]:
             print(f"  {DIM}  {r['url']}")
             print(f"       {json.dumps(r['data'], ensure_ascii=False)[:300]}{RESET}")
         print(f"  {DIM}API extraído: {api}{RESET}")
