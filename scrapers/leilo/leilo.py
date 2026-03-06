@@ -24,6 +24,10 @@ import json
 import re
 import sys
 import argparse
+import os
+import io
+import time
+import requests as _requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from playwright.async_api import async_playwright, Response
@@ -245,7 +249,6 @@ def normalize_to_db(lote: dict, tipo_override: str = None) -> dict | None:
     # KM
     km = parse_km(lote.get("km"))
 
-    # Imagens
     imagens = lote.get("imagens") or []
 
     return {
@@ -263,9 +266,9 @@ def normalize_to_db(lote: dict, tipo_override: str = None) -> dict | None:
         "valor_atual":           lote.get("lance_raw"),   # mesmo valor — atualizado em tempo real
         "data_encerramento":     data_enc,
         "link":                  link,
-        "imagem_1":              imagens[0] if len(imagens) > 0 else None,
-        "imagem_2":              imagens[1] if len(imagens) > 1 else None,
-        "imagem_3":              imagens[2] if len(imagens) > 2 else None,
+        "imagem_1":              mirror_image(imagens[0] if len(imagens) > 0 else None),
+        "imagem_2":              mirror_image(imagens[1] if len(imagens) > 1 else None),
+        "imagem_3":              mirror_image(imagens[2] if len(imagens) > 2 else None),
         "percentual_abaixo_fipe": lote.get("desconto_pct"),
         "margem_revenda":         lote.get("margem_revenda"),
         "km":                    km,
@@ -273,6 +276,107 @@ def normalize_to_db(lote: dict, tipo_override: str = None) -> dict | None:
         "ativo":                 True,
     }
 
+
+
+# ─── Mirror de imagens → Supabase Storage ────────────────────────────────────
+
+LEILO_CDN   = "leilo.cdndp.com.br"
+PLACEHOLDER = "/place.png"
+BUCKET      = "veiculos-imagens"   # bucket público no Supabase Storage
+
+# Headers que imitam o browser dentro do leilo.com.br
+_IMG_HEADERS = {
+    "User-Agent":  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 Chrome/122 Safari/537.36",
+    "Referer":     "https://leilo.com.br/",
+    "Accept":      "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+}
+
+def _supabase_storage_url() -> str | None:
+    base = os.getenv("SUPABASE_URL", "").rstrip("/")
+    return f"{base}/storage/v1/object/{BUCKET}" if base else None
+
+def _supabase_public_url(path: str) -> str | None:
+    base = os.getenv("SUPABASE_URL", "").rstrip("/")
+    return f"{base}/storage/v1/object/public/{BUCKET}/{path}" if base else None
+
+def mirror_image(url: str | None, max_retries: int = 3) -> str:
+    """
+    Tenta baixar a imagem do CDN do leilo (com Referer correto) e
+    sobe para o Supabase Storage.
+    Retorna a URL pública do Storage, ou PLACEHOLDER em caso de falha.
+    """
+    if not url:
+        return PLACEHOLDER
+
+    # Se não é do CDN bloqueado, retorna direta
+    if LEILO_CDN not in url:
+        return url
+
+    storage_base = _supabase_storage_url()
+    if not storage_base:
+        return PLACEHOLDER  # sem credenciais, nem tenta
+
+    # Deriva um path único a partir da URL original
+    # ex: "2026/3/5/1772740577709_abc.jpeg"
+    m = re.search(r"/v1/arquivo/(.+)$", url)
+    storage_path = m.group(1) if m else re.sub(r"[^a-zA-Z0-9._/-]", "_", url[-60:])
+    public_url = _supabase_public_url(storage_path)
+
+    # Verifica se já existe no storage (evita re-upload)
+    try:
+        check = _requests.head(public_url, timeout=5)
+        if check.status_code == 200:
+            return public_url
+    except Exception:
+        pass
+
+    # Tenta baixar com retry
+    img_bytes = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = _requests.get(url, headers=_IMG_HEADERS, timeout=15)
+            if r.status_code == 200 and len(r.content) > 1000:
+                img_bytes = r.content
+                break
+            print(f"    {DIM}⚠️  img HTTP {r.status_code} (tentativa {attempt}/{max_retries}){RESET}")
+        except Exception as e:
+            print(f"    {DIM}⚠️  img erro: {e} (tentativa {attempt}/{max_retries}){RESET}")
+        if attempt < max_retries:
+            time.sleep(1.5 * attempt)
+
+    if not img_bytes:
+        return PLACEHOLDER
+
+    # Detecta content-type
+    ct = "image/jpeg"
+    if storage_path.endswith(".png"):
+        ct = "image/png"
+    elif storage_path.endswith(".webp"):
+        ct = "image/webp"
+
+    # Sobe para o Supabase Storage
+    key  = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+    hdrs = {
+        "apikey":        key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type":  ct,
+        "x-upsert":      "true",
+    }
+    try:
+        up = _requests.post(
+            f"{storage_base}/{storage_path}",
+            data=img_bytes,
+            headers=hdrs,
+            timeout=30,
+        )
+        if up.status_code in (200, 201):
+            return public_url
+        print(f"    {DIM}⚠️  storage upload HTTP {up.status_code}: {up.text[:120]}{RESET}")
+    except Exception as e:
+        print(f"    {DIM}⚠️  storage upload erro: {e}{RESET}")
+
+    return PLACEHOLDER
 
 # ─── Passive network capture ─────────────────────────────────────────────────
 
@@ -771,8 +875,8 @@ def upload_to_supabase(lotes: list[dict], tipo: str) -> dict:
 
     stats = db.upsert_veiculos(registros)
 
-    print(f"\n  ✅  Inserted/updated: {stats.get('inserted', 0)}")
-    print(f"  ❌  Errors:           {stats.get('errors', 0)}")
+    total_enviados = stats.get('inserted', 0) + stats.get('updated', 0)
+    print(f"\n  ✅  Enviados:         {total_enviados}  ({stats.get('inserted', 0)} novos  +  {stats.get('updated', 0)} atualizados)")
     print(f"  🔄  Dupes removidas:  {stats.get('duplicates_removed', 0)}")
 
     return stats
@@ -864,7 +968,7 @@ async def main():
     print(f"  {DIM}{len(targets)} categoria(s) | upload: {'não' if args.no_upload else 'sim'}{RESET}\n")
 
     todos_lotes: list[dict] = []
-    stats_total = {'inserted': 0, 'errors': 0, 'duplicates_removed': 0}
+    stats_total = {'inserted': 0, 'updated': 0, 'errors': 0, 'duplicates_removed': 0}
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=not args.show)
@@ -887,7 +991,7 @@ async def main():
 
                 if not args.no_upload:
                     stats = upload_to_supabase(lotes, tipo)
-                    for k in ('inserted', 'errors', 'duplicates_removed'):
+                    for k in ('inserted', 'updated', 'errors', 'duplicates_removed'):
                         stats_total[k] = stats_total.get(k, 0) + stats.get(k, 0)
 
         await browser.close()
@@ -913,9 +1017,9 @@ async def main():
     print(f"  Total lotes coletados: {len(todos_lotes)}")
     print(f"  Com desconto calculado: {len(com)}")
     if not args.no_upload:
-        print(f"  Enviados ao Supabase:   {stats_total['inserted']}")
+        total_s = stats_total['inserted'] + stats_total['updated']
+        print(f"  Enviados ao Supabase:   {total_s}  ({stats_total['inserted']} novos  +  {stats_total['updated']} atualizados)")
         print(f"  Erros:                  {stats_total['errors']}")
-    print(f"  JSON local: {args.output}\n")
 
 
 if __name__ == "__main__":
