@@ -300,11 +300,26 @@ _IMG_HEADERS = {
 _LEILO_PLACEHOLDER_HASHES: set[str] = set()
 _LEILO_PLACEHOLDER_LOADED = False
 
-# URL conhecida de uma imagem-placeholder do leilo (detectada em produção)
-_KNOWN_BAD_URL = (
+# URLs CDN conhecidas de imagens-placeholder do leilo (detectadas em produção).
+# Adicione aqui novas URLs ruins sempre que surgir um novo placeholder.
+_KNOWN_BAD_CDN_URLS: set[str] = {
     "https://leilo.cdndp.com.br/v1/arquivo/2026/2/9/"
-    "1770646170608_4c65f0d2-72dc-49d2-a98b-43ef8dc32ae0.jpeg"
-)
+    "1770646170608_4c65f0d2-72dc-49d2-a98b-43ef8dc32ae0.jpeg",
+}
+
+# Storage paths derivados das URLs ruins acima — bloqueados mesmo após HEAD 200.
+# Gerado automaticamente a partir de _KNOWN_BAD_CDN_URLS.
+def _bad_storage_paths() -> set[str]:
+    paths = set()
+    for u in _KNOWN_BAD_CDN_URLS:
+        m = re.search(r"/v1/arquivo/(.+)$", u)
+        paths.add(m.group(1) if m else u[-60:])
+    return paths
+
+_BAD_STORAGE_PATHS: set[str] = _bad_storage_paths()
+
+# Mantém compatibilidade com _KNOWN_BAD_URL usado em _load_bad_hashes
+_KNOWN_BAD_URL = next(iter(_KNOWN_BAD_CDN_URLS))
 
 def _load_bad_hashes():
     """Baixa a imagem ruim conhecida e armazena o hash para comparação futura."""
@@ -346,6 +361,12 @@ def mirror_image(url: str | None, max_retries: int = 3) -> str:
     if not url:
         return PLACEHOLDER
 
+    # Rejeita imediatamente URLs CDN conhecidas como placeholder/lixo.
+    # Evita download E evita retornar path já existente no Storage.
+    if url in _KNOWN_BAD_CDN_URLS:
+        print(f"    {DIM}⚠️  URL de imagem-lixo bloqueada: {url[-60:]}{RESET}")
+        return PLACEHOLDER
+
     # Se não é do CDN bloqueado, retorna direta
     if LEILO_CDN not in url:
         return url
@@ -359,6 +380,12 @@ def mirror_image(url: str | None, max_retries: int = 3) -> str:
     m = re.search(r"/v1/arquivo/(.+)$", url)
     storage_path = m.group(1) if m else re.sub(r"[^a-zA-Z0-9._/-]", "_", url[-60:])
     public_url = _supabase_public_url(storage_path)
+
+    # Bloqueia paths que sabemos ser de imagens ruins no Storage —
+    # mesmo que já existam lá (HEAD 200), não servimos.
+    if storage_path in _BAD_STORAGE_PATHS:
+        print(f"    {DIM}⚠️  storage path de imagem-lixo bloqueado: {storage_path}{RESET}")
+        return PLACEHOLDER
 
     # Verifica se já existe no storage (evita re-upload)
     try:
