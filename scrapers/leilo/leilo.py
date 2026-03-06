@@ -272,13 +272,15 @@ def normalize_to_db(lote: dict, tipo_override: str = None) -> dict | None:
         "percentual_abaixo_fipe": lote.get("desconto_pct"),
         "margem_revenda":         lote.get("margem_revenda"),
         "km":                    km,
-        "origem":                "leilo",
+        "origem":                lote.get("tipo_retomada") if lote.get("tipo_retomada") not in (None, "—") else "leilo",
         "ativo":                 True,
     }
 
 
 
 # ─── Mirror de imagens → Supabase Storage ────────────────────────────────────
+
+import hashlib as _hashlib
 
 LEILO_CDN   = "leilo.cdndp.com.br"
 PLACEHOLDER = "/place.png"
@@ -291,6 +293,39 @@ _IMG_HEADERS = {
     "Referer":     "https://leilo.com.br/",
     "Accept":      "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
 }
+
+# Hash MD5 da imagem genérica que o leilo serve quando a foto ainda não existe.
+# Calculado na primeira chamada e cacheado — qualquer download que bata esse
+# hash é descartado e substituído pelo placeholder.
+_LEILO_PLACEHOLDER_HASHES: set[str] = set()
+_LEILO_PLACEHOLDER_LOADED = False
+
+# URL conhecida de uma imagem-placeholder do leilo (detectada em produção)
+_KNOWN_BAD_URL = (
+    "https://leilo.cdndp.com.br/v1/arquivo/2026/2/9/"
+    "1770646170608_4c65f0d2-72dc-49d2-a98b-43ef8dc32ae0.jpeg"
+)
+
+def _load_bad_hashes():
+    """Baixa a imagem ruim conhecida e armazena o hash para comparação futura."""
+    global _LEILO_PLACEHOLDER_LOADED
+    if _LEILO_PLACEHOLDER_LOADED:
+        return
+    _LEILO_PLACEHOLDER_LOADED = True
+    try:
+        r = _requests.get(_KNOWN_BAD_URL, headers=_IMG_HEADERS, timeout=10)
+        if r.status_code == 200 and r.content:
+            h = _hashlib.md5(r.content).hexdigest()
+            _LEILO_PLACEHOLDER_HASHES.add(h)
+            print(f"  {DIM}📷  hash da imagem-lixo do leilo carregado: {h}{RESET}")
+    except Exception as e:
+        print(f"  {DIM}⚠️  não conseguiu carregar hash da imagem-lixo: {e}{RESET}")
+
+def _is_bad_image(img_bytes: bytes) -> bool:
+    """True se o conteúdo baixado é a imagem genérica do leilo."""
+    if not _LEILO_PLACEHOLDER_HASHES:
+        return False
+    return _hashlib.md5(img_bytes).hexdigest() in _LEILO_PLACEHOLDER_HASHES
 
 def _supabase_storage_url() -> str | None:
     base = os.getenv("SUPABASE_URL", "").rstrip("/")
@@ -306,6 +341,8 @@ def mirror_image(url: str | None, max_retries: int = 3) -> str:
     sobe para o Supabase Storage.
     Retorna a URL pública do Storage, ou PLACEHOLDER em caso de falha.
     """
+    _load_bad_hashes()   # no-op após primeira chamada
+
     if not url:
         return PLACEHOLDER
 
@@ -346,6 +383,11 @@ def mirror_image(url: str | None, max_retries: int = 3) -> str:
             time.sleep(1.5 * attempt)
 
     if not img_bytes:
+        return PLACEHOLDER
+
+    # Rejeita se for a imagem genérica/placeholder do leilo
+    if _is_bad_image(img_bytes):
+        print(f"    {DIM}⚠️  imagem genérica do leilo detectada — usando placeholder{RESET}")
         return PLACEHOLDER
 
     # Detecta content-type
@@ -467,6 +509,9 @@ def extract_api_fields(responses: list[dict]) -> dict:
 
             if ("combustivel" in kl or "fuel" in kl) and isinstance(v, str) and len(v) < 30:
                 extras.setdefault("combustivel", v)
+
+            if kl == "retomada" and isinstance(v, str) and 2 < len(v) < 80:
+                extras.setdefault("retomada", v)
 
             if kl in ("anomodelo", "anofabricacao", "modelyear") and isinstance(v, (int, str)):
                 extras.setdefault("ano", str(v))
@@ -821,7 +866,7 @@ async def get_lot_detail(page, url: str, net: NetworkCapture,
     m_lance = parse_brl(lance_raw)
     if m_fipe and m_lance:
         margem = round(m_fipe - m_lance - 15_000, 2)
-        margem_revenda = margem if margem > 0 else None
+        margem_revenda = margem if margem >= 10_000 else None
 
     return {
         "url":               url,
@@ -838,7 +883,7 @@ async def get_lot_detail(page, url: str, net: NetworkCapture,
         "combustivel":       pares_or_api("Combustivel", "combustivel"),
         "cor":               pares_or_api("Cor", "cor"),
         "chave":             pares_or_api("Possui Chave"),
-        "tipo_retomada":     pares_or_api("Tipo Retomada"),
+        "tipo_retomada":     pares_or_api("Tipo Retomada", "retomada"),
         "localizacao":       pares_or_api("Localização"),
         "descricao":         dom.get("descricao") or "—",
         "imagens":           imagens,
@@ -902,38 +947,81 @@ async def scrape_categoria(url: str, tipo: str, ctx, args) -> list[dict]:
         return [{"url": lnk} for lnk in lot_links]
 
     page_det = await ctx.new_page()
-    lotes = []
-    skipped = 0
+    lotes   = []
+    lixo    = 0   # margem < 10k
+    sem_lance = 0
+
+    MAX_TENTATIVAS = 3
+
+    def _lote_ok(lote: dict) -> tuple[bool, str]:
+        """Verifica se o lote tem todos os campos obrigatórios."""
+        if not lote.get("lance_raw"):
+            return False, "sem lance"
+        if not lote.get("valor_mercado_raw"):
+            return False, "sem FIPE"
+        if lote.get("titulo") in (None, "—", ""):
+            return False, "sem título"
+        imagens = lote.get("imagens") or []
+        if not imagens:
+            return False, "sem imagens"
+        return True, "ok"
 
     for i, link in enumerate(lot_links, 1):
-        print(f"  {DIM}[{i:>3}/{len(lot_links)}]{RESET} ...{link[-50:]}")
-        try:
-            lote = await get_lot_detail(page_det, link, net, debug=args.debug)
+        prefix = f"  {DIM}[{i:>3}/{len(lot_links)}]{RESET}"
+        print(f"{prefix} ...{link[-50:]}")
 
-            if not lote.get("lance_raw"):
-                skipped += 1
-                print(f"         {DIM}⏭  sem lance ativo — ignorado{RESET}\n")
-                continue
+        lote = None
+        for tentativa in range(1, MAX_TENTATIVAS + 1):
+            try:
+                lote = await get_lot_detail(page_det, link, net, debug=args.debug)
+                ok, motivo = _lote_ok(lote)
+                if ok:
+                    break
+                # sem lance ativo é definitivo — não retenta
+                if motivo == "sem lance":
+                    lote = None
+                    break
+                print(f"         {DIM}↻  tentativa {tentativa}/{MAX_TENTATIVAS}: {motivo}{RESET}")
+                await asyncio.sleep(2 * tentativa)
+            except Exception as e:
+                print(f"         {DIM}↻  tentativa {tentativa}/{MAX_TENTATIVAS} ERRO: {e}{RESET}")
+                lote = None
+                await asyncio.sleep(2 * tentativa)
 
-            lotes.append(lote)
-            titulo  = (lote["titulo"] or "")[:50]
-            desc    = lote.get("desconto_pct")
-            margem  = lote.get("margem_revenda")
-            n_imgs  = len(lote.get("imagens") or [])
-            cor     = GREEN if (desc or 0) >= 30 else YELLOW
-            margem_str = f"  Margem {GREEN}R$ {margem:,.0f}{RESET}" if margem else ""
-            print(f"         {YELLOW}{titulo}{RESET}")
-            print(f"         Lance {GREEN}{lote['lance']}{RESET}  ·  "
-                  f"Mercado {lote['valor_mercado']}  ·  "
-                  f"{cor}{lote['desconto_label']}{RESET}"
-                  f"{margem_str}  ·  🖼 {n_imgs} fotos\n")
+        if lote is None:
+            sem_lance += 1
+            print(f"         {DIM}⏭  sem lance ativo — ignorado{RESET}\n")
+            continue
 
-        except Exception as e:
-            print(f"         {RED}ERRO: {e}{RESET}\n")
-            lotes.append({"url": link, "erro": str(e)})
+        ok, motivo = _lote_ok(lote)
+        if not ok:
+            print(f"         {RED}✗  descartado após {MAX_TENTATIVAS} tentativas: {motivo}{RESET}\n")
+            continue
 
-    if skipped:
-        print(f"  {DIM}⏭  {skipped} lote(s) ignorado(s) — sem lance ativo{RESET}\n")
+        # Filtra margem < 10k — isso fede
+        margem = lote.get("margem_revenda")
+        if margem is None:
+            lixo += 1
+            titulo_lixo = (lote.get("titulo") or "")[:45]
+            print(f"         {DIM}🗑  margem insuficiente — {titulo_lixo}{RESET}\n")
+            continue
+
+        lotes.append(lote)
+        titulo = (lote["titulo"] or "")[:50]
+        desc   = lote.get("desconto_pct")
+        n_imgs = len(lote.get("imagens") or [])
+        cor    = GREEN if (desc or 0) >= 30 else YELLOW
+        print(f"         {YELLOW}{titulo}{RESET}")
+        print(f"         Lance {GREEN}{lote['lance']}{RESET}  ·  "
+              f"Mercado {lote['valor_mercado']}  ·  "
+              f"{cor}{lote['desconto_label']}{RESET}"
+              f"  ·  Margem {GREEN}R$ {margem:,.0f}{RESET}"
+              f"  ·  🖼 {n_imgs} fotos\n")
+
+    if sem_lance:
+        print(f"  {DIM}⏭  {sem_lance} lote(s) sem lance ativo{RESET}\n")
+    if lixo:
+        print(f"  {DIM}🗑  {lixo} lote(s) descartados (margem < R$ 10.000){RESET}\n")
 
     await page_det.close()
     return lotes
