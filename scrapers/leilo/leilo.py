@@ -25,9 +25,6 @@ import re
 import sys
 import argparse
 import os
-import io
-import time
-import requests as _requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from playwright.async_api import async_playwright, Response
@@ -251,13 +248,6 @@ def normalize_to_db(lote: dict, tipo_override: str = None) -> dict | None:
 
     imagens = lote.get("imagens") or []
 
-    # Extrai UUID do lote para usar como namespace no Storage.
-    # Garante que imagens de lotes diferentes nunca compartilhem o mesmo path.
-    lot_uuid_m = re.search(
-        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", link, re.I
-    )
-    lot_uuid = lot_uuid_m.group(0).lower() if lot_uuid_m else None
-
     return {
         "titulo":                titulo,
         "descricao":             lote.get("descricao") if lote.get("descricao") not in (None, "—") else None,
@@ -270,12 +260,12 @@ def normalize_to_db(lote: dict, tipo_override: str = None) -> dict | None:
         "ano_modelo":            ano_modelo,
         "modalidade":            "leilao",
         "valor_inicial":         valor_inicial,
-        "valor_atual":           lote.get("lance_raw"),   # mesmo valor — atualizado em tempo real
+        "valor_atual":           lote.get("lance_raw"),
         "data_encerramento":     data_enc,
         "link":                  link,
-        "imagem_1":              mirror_image(imagens[0] if len(imagens) > 0 else None, lot_uuid=lot_uuid),
-        "imagem_2":              mirror_image(imagens[1] if len(imagens) > 1 else None, lot_uuid=lot_uuid),
-        "imagem_3":              mirror_image(imagens[2] if len(imagens) > 2 else None, lot_uuid=lot_uuid),
+        "imagem_1":              imagens[0] if len(imagens) > 0 else None,
+        "imagem_2":              imagens[1] if len(imagens) > 1 else None,
+        "imagem_3":              imagens[2] if len(imagens) > 2 else None,
         "percentual_abaixo_fipe": lote.get("desconto_pct"),
         "margem_revenda":         lote.get("margem_revenda"),
         "km":                    km,
@@ -285,187 +275,8 @@ def normalize_to_db(lote: dict, tipo_override: str = None) -> dict | None:
 
 
 
-# ─── Mirror de imagens → Supabase Storage ────────────────────────────────────
 
-import hashlib as _hashlib
-
-LEILO_CDN   = "leilo.cdndp.com.br"
-PLACEHOLDER = "/place.png"
-BUCKET      = "veiculos-imagens"   # bucket público no Supabase Storage
-
-# Headers que imitam o browser dentro do leilo.com.br
-_IMG_HEADERS = {
-    "User-Agent":  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/537.36 Chrome/122 Safari/537.36",
-    "Referer":     "https://leilo.com.br/",
-    "Accept":      "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-}
-
-# Hash MD5 da imagem genérica que o leilo serve quando a foto ainda não existe.
-# Calculado na primeira chamada e cacheado — qualquer download que bata esse
-# hash é descartado e substituído pelo placeholder.
-_LEILO_PLACEHOLDER_HASHES: set[str] = set()
-_LEILO_PLACEHOLDER_LOADED = False
-
-# URLs CDN conhecidas de imagens-placeholder do leilo (detectadas em produção).
-# Adicione aqui novas URLs ruins sempre que surgir um novo placeholder.
-_KNOWN_BAD_CDN_URLS: set[str] = {
-    "https://leilo.cdndp.com.br/v1/arquivo/2026/2/9/"
-    "1770646170608_4c65f0d2-72dc-49d2-a98b-43ef8dc32ae0.jpeg",
-}
-
-# Storage paths derivados das URLs ruins acima — bloqueados mesmo após HEAD 200.
-# Gerado automaticamente a partir de _KNOWN_BAD_CDN_URLS.
-def _bad_storage_paths() -> set[str]:
-    paths = set()
-    for u in _KNOWN_BAD_CDN_URLS:
-        m = re.search(r"/v1/arquivo/(.+)$", u)
-        paths.add(m.group(1) if m else u[-60:])
-    return paths
-
-_BAD_STORAGE_PATHS: set[str] = _bad_storage_paths()
-
-# Mantém compatibilidade com _KNOWN_BAD_URL usado em _load_bad_hashes
-_KNOWN_BAD_URL = next(iter(_KNOWN_BAD_CDN_URLS))
-
-def _load_bad_hashes():
-    """Baixa a imagem ruim conhecida e armazena o hash para comparação futura."""
-    global _LEILO_PLACEHOLDER_LOADED
-    if _LEILO_PLACEHOLDER_LOADED:
-        return
-    _LEILO_PLACEHOLDER_LOADED = True
-    try:
-        r = _requests.get(_KNOWN_BAD_URL, headers=_IMG_HEADERS, timeout=10)
-        if r.status_code == 200 and r.content:
-            h = _hashlib.md5(r.content).hexdigest()
-            _LEILO_PLACEHOLDER_HASHES.add(h)
-            print(f"  {DIM}📷  hash da imagem-lixo do leilo carregado: {h}{RESET}")
-    except Exception as e:
-        print(f"  {DIM}⚠️  não conseguiu carregar hash da imagem-lixo: {e}{RESET}")
-
-def _is_bad_image(img_bytes: bytes) -> bool:
-    """True se o conteúdo baixado é a imagem genérica do leilo."""
-    if not _LEILO_PLACEHOLDER_HASHES:
-        return False
-    return _hashlib.md5(img_bytes).hexdigest() in _LEILO_PLACEHOLDER_HASHES
-
-def _supabase_storage_url() -> str | None:
-    base = os.getenv("SUPABASE_URL", "").rstrip("/")
-    return f"{base}/storage/v1/object/{BUCKET}" if base else None
-
-def _supabase_public_url(path: str) -> str | None:
-    base = os.getenv("SUPABASE_URL", "").rstrip("/")
-    return f"{base}/storage/v1/object/public/{BUCKET}/{path}" if base else None
-
-def mirror_image(url: str | None, max_retries: int = 3, lot_uuid: str | None = None) -> str:
-    """
-    Tenta baixar a imagem do CDN do leilo (com Referer correto) e
-    sobe para o Supabase Storage.
-
-    O storage_path é prefixado pelo UUID do lote, garantindo que
-    imagens de lotes diferentes nunca compartilhem o mesmo arquivo —
-    elimina o bug de imagens cruzadas entre lotes.
-
-    Retorna a URL pública do Storage, ou PLACEHOLDER em caso de falha.
-    """
-    _load_bad_hashes()   # no-op após primeira chamada
-
-    if not url:
-        return PLACEHOLDER
-
-    # Rejeita imediatamente URLs CDN conhecidas como placeholder/lixo.
-    if url in _KNOWN_BAD_CDN_URLS:
-        print(f"    {DIM}⚠️  URL de imagem-lixo bloqueada: {url[-60:]}{RESET}")
-        return PLACEHOLDER
-
-    # Se não é do CDN bloqueado, retorna direta
-    if LEILO_CDN not in url:
-        return url
-
-    storage_base = _supabase_storage_url()
-    if not storage_base:
-        return PLACEHOLDER  # sem credenciais, nem tenta
-
-    # Deriva o filename da URL original
-    # ex: "1772740577709_abc.jpeg"
-    m = re.search(r"/v1/arquivo/(.+)$", url)
-    raw_path = m.group(1) if m else re.sub(r"[^a-zA-Z0-9._/-]", "_", url[-60:])
-    filename = raw_path.split("/")[-1]  # só o filename
-
-    # Namespace por UUID do lote: "lotes/{lot_uuid}/{filename}"
-    # Se não tiver UUID (fallback raro), usa o path original inteiro.
-    if lot_uuid:
-        storage_path = f"lotes/{lot_uuid}/{filename}"
-    else:
-        storage_path = raw_path
-
-    # Bloqueia paths que sabemos ser de imagens ruins no Storage
-    if raw_path in _BAD_STORAGE_PATHS or storage_path in _BAD_STORAGE_PATHS:
-        print(f"    {DIM}⚠️  storage path de imagem-lixo bloqueado: {storage_path}{RESET}")
-        return PLACEHOLDER
-
-    public_url = _supabase_public_url(storage_path)
-
-    # Verifica se já existe no storage (evita re-upload).
-    # Com namespace por UUID, esse cache é confiável: se existe, é deste lote.
-    try:
-        check = _requests.head(public_url, timeout=5)
-        if check.status_code == 200:
-            return public_url
-    except Exception:
-        pass
-
-    # Tenta baixar com retry
-    img_bytes = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            r = _requests.get(url, headers=_IMG_HEADERS, timeout=15)
-            if r.status_code == 200 and len(r.content) > 1000:
-                img_bytes = r.content
-                break
-            print(f"    {DIM}⚠️  img HTTP {r.status_code} (tentativa {attempt}/{max_retries}){RESET}")
-        except Exception as e:
-            print(f"    {DIM}⚠️  img erro: {e} (tentativa {attempt}/{max_retries}){RESET}")
-        if attempt < max_retries:
-            time.sleep(1.5 * attempt)
-
-    if not img_bytes:
-        return PLACEHOLDER
-
-    # Rejeita se for a imagem genérica/placeholder do leilo
-    if _is_bad_image(img_bytes):
-        print(f"    {DIM}⚠️  imagem genérica do leilo detectada — usando placeholder{RESET}")
-        return PLACEHOLDER
-
-    # Detecta content-type
-    ct = "image/jpeg"
-    if storage_path.endswith(".png"):
-        ct = "image/png"
-    elif storage_path.endswith(".webp"):
-        ct = "image/webp"
-
-    # Sobe para o Supabase Storage
-    key  = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
-    hdrs = {
-        "apikey":        key,
-        "Authorization": f"Bearer {key}",
-        "Content-Type":  ct,
-        "x-upsert":      "true",
-    }
-    try:
-        up = _requests.post(
-            f"{storage_base}/{storage_path}",
-            data=img_bytes,
-            headers=hdrs,
-            timeout=30,
-        )
-        if up.status_code in (200, 201):
-            return public_url
-        print(f"    {DIM}⚠️  storage upload HTTP {up.status_code}: {up.text[:120]}{RESET}")
-    except Exception as e:
-        print(f"    {DIM}⚠️  storage upload erro: {e}{RESET}")
-
-    return PLACEHOLDER
+PLACEHOLDER = None  # sem imagem = null no banco
 
 # ─── Passive network capture ─────────────────────────────────────────────────
 
@@ -572,10 +383,9 @@ def extract_api_fields(responses: list[dict]) -> dict:
                 if isinstance(v, str) and len(v) > 6:
                     extras.setdefault("data_encerramento_api", v)
 
-            # Imagens via fotosUrls (campo principal da API do leilo).
-            # Coleta TODOS os candidatos e usa o MAIOR conjunto encontrado —
-            # evita que uma resposta de listagem (fotos de outros lotes)
-            # sobrescreva as fotos corretas do lote atual.
+            # Imagens via fotosUrls — usa o MAIOR conjunto encontrado.
+            # A resposta do detalhe do lote sempre terá mais fotos que
+            # respostas laterais de listagem/recomendados.
             if kl in ("fotosurls", "fotos", "fotosurl", "photos", "images", "imagens"):
                 if isinstance(v, list):
                     urls_validas = [
@@ -851,16 +661,13 @@ async def get_lot_detail(page, url: str, net: NetworkCapture,
 
     dom = await page.evaluate(DOM_JS)
 
-    # Extrai o UUID do lote a partir da URL para filtrar respostas de rede.
-    # Evita que respostas de listagem/recomendações (com fotos de OUTROS lotes)
-    # contaminem as fotos do lote atual.
+    # Filtra respostas de rede pelo UUID do lote — evita que respostas de
+    # listagem/recomendações (com fotos de OUTROS lotes) contaminem este lote.
     lot_uuid_match = re.search(
         r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", url, re.I
     )
     lot_uuid = lot_uuid_match.group(0).lower() if lot_uuid_match else None
 
-    # Prioridade: respostas cujo URL contém o UUID do lote atual.
-    # Fallback: todas as respostas (comportamento anterior).
     if lot_uuid:
         specific = [r for r in net.responses if lot_uuid in r["url"].lower()]
         responses_to_use = specific if specific else net.responses
@@ -871,7 +678,7 @@ async def get_lot_detail(page, url: str, net: NetworkCapture,
 
     if debug:
         print(f"\n  {DIM}── DEBUG ─────────────────────────────────────────{RESET}")
-        print(f"  {DIM}API responses total: {len(net.responses)} | usadas: {len(responses_to_use)}{RESET}")
+        print(f"  {DIM}Respostas total: {len(net.responses)} | com UUID: {len(responses_to_use)}{RESET}")
         for r in responses_to_use[:3]:
             print(f"  {DIM}  {r['url']}")
             print(f"       {json.dumps(r['data'], ensure_ascii=False)[:300]}{RESET}")
