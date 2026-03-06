@@ -251,6 +251,13 @@ def normalize_to_db(lote: dict, tipo_override: str = None) -> dict | None:
 
     imagens = lote.get("imagens") or []
 
+    # Extrai UUID do lote para usar como namespace no Storage.
+    # Garante que imagens de lotes diferentes nunca compartilhem o mesmo path.
+    lot_uuid_m = re.search(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", link, re.I
+    )
+    lot_uuid = lot_uuid_m.group(0).lower() if lot_uuid_m else None
+
     return {
         "titulo":                titulo,
         "descricao":             lote.get("descricao") if lote.get("descricao") not in (None, "—") else None,
@@ -266,9 +273,9 @@ def normalize_to_db(lote: dict, tipo_override: str = None) -> dict | None:
         "valor_atual":           lote.get("lance_raw"),   # mesmo valor — atualizado em tempo real
         "data_encerramento":     data_enc,
         "link":                  link,
-        "imagem_1":              mirror_image(imagens[0] if len(imagens) > 0 else None),
-        "imagem_2":              mirror_image(imagens[1] if len(imagens) > 1 else None),
-        "imagem_3":              mirror_image(imagens[2] if len(imagens) > 2 else None),
+        "imagem_1":              mirror_image(imagens[0] if len(imagens) > 0 else None, lot_uuid=lot_uuid),
+        "imagem_2":              mirror_image(imagens[1] if len(imagens) > 1 else None, lot_uuid=lot_uuid),
+        "imagem_3":              mirror_image(imagens[2] if len(imagens) > 2 else None, lot_uuid=lot_uuid),
         "percentual_abaixo_fipe": lote.get("desconto_pct"),
         "margem_revenda":         lote.get("margem_revenda"),
         "km":                    km,
@@ -350,10 +357,15 @@ def _supabase_public_url(path: str) -> str | None:
     base = os.getenv("SUPABASE_URL", "").rstrip("/")
     return f"{base}/storage/v1/object/public/{BUCKET}/{path}" if base else None
 
-def mirror_image(url: str | None, max_retries: int = 3) -> str:
+def mirror_image(url: str | None, max_retries: int = 3, lot_uuid: str | None = None) -> str:
     """
     Tenta baixar a imagem do CDN do leilo (com Referer correto) e
     sobe para o Supabase Storage.
+
+    O storage_path é prefixado pelo UUID do lote, garantindo que
+    imagens de lotes diferentes nunca compartilhem o mesmo arquivo —
+    elimina o bug de imagens cruzadas entre lotes.
+
     Retorna a URL pública do Storage, ou PLACEHOLDER em caso de falha.
     """
     _load_bad_hashes()   # no-op após primeira chamada
@@ -362,7 +374,6 @@ def mirror_image(url: str | None, max_retries: int = 3) -> str:
         return PLACEHOLDER
 
     # Rejeita imediatamente URLs CDN conhecidas como placeholder/lixo.
-    # Evita download E evita retornar path já existente no Storage.
     if url in _KNOWN_BAD_CDN_URLS:
         print(f"    {DIM}⚠️  URL de imagem-lixo bloqueada: {url[-60:]}{RESET}")
         return PLACEHOLDER
@@ -375,19 +386,28 @@ def mirror_image(url: str | None, max_retries: int = 3) -> str:
     if not storage_base:
         return PLACEHOLDER  # sem credenciais, nem tenta
 
-    # Deriva um path único a partir da URL original
-    # ex: "2026/3/5/1772740577709_abc.jpeg"
+    # Deriva o filename da URL original
+    # ex: "1772740577709_abc.jpeg"
     m = re.search(r"/v1/arquivo/(.+)$", url)
-    storage_path = m.group(1) if m else re.sub(r"[^a-zA-Z0-9._/-]", "_", url[-60:])
-    public_url = _supabase_public_url(storage_path)
+    raw_path = m.group(1) if m else re.sub(r"[^a-zA-Z0-9._/-]", "_", url[-60:])
+    filename = raw_path.split("/")[-1]  # só o filename
 
-    # Bloqueia paths que sabemos ser de imagens ruins no Storage —
-    # mesmo que já existam lá (HEAD 200), não servimos.
-    if storage_path in _BAD_STORAGE_PATHS:
+    # Namespace por UUID do lote: "lotes/{lot_uuid}/{filename}"
+    # Se não tiver UUID (fallback raro), usa o path original inteiro.
+    if lot_uuid:
+        storage_path = f"lotes/{lot_uuid}/{filename}"
+    else:
+        storage_path = raw_path
+
+    # Bloqueia paths que sabemos ser de imagens ruins no Storage
+    if raw_path in _BAD_STORAGE_PATHS or storage_path in _BAD_STORAGE_PATHS:
         print(f"    {DIM}⚠️  storage path de imagem-lixo bloqueado: {storage_path}{RESET}")
         return PLACEHOLDER
 
-    # Verifica se já existe no storage (evita re-upload)
+    public_url = _supabase_public_url(storage_path)
+
+    # Verifica se já existe no storage (evita re-upload).
+    # Com namespace por UUID, esse cache é confiável: se existe, é deste lote.
     try:
         check = _requests.head(public_url, timeout=5)
         if check.status_code == 200:
