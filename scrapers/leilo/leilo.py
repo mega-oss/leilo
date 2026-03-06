@@ -354,12 +354,14 @@ def _find_fotos_for_uuid(obj, lot_uuid: str, depth=0) -> list[str] | None:
                             and "placeholder" not in u and "logo" not in u]
                     if urls:
                         return urls
-        # UUID aqui mas sem fotos diretas — desce nos filhos
+                    else:
+                        return []  # achou o lote, fotosUrls vazio — não usa fallback
+        # UUID aqui mas sem campo fotosUrls — desce nos filhos
         for v in obj.values():
             r = _find_fotos_for_uuid(v, lot_uuid, depth + 1)
             if r is not None:
                 return r
-        return None
+        return []  # achou o lote mas sem fotos em lugar nenhum
 
     # Sem UUID neste nível — desce
     for v in obj.values():
@@ -442,11 +444,11 @@ def extract_api_fields(responses: list[dict], lot_uuid: str | None = None) -> di
                 if isinstance(v, str) and len(v) > 6:
                     extras.setdefault("data_encerramento_api", v)
 
-            # Imagens via fotosUrls — usa o MAIOR conjunto encontrado.
-            # A resposta do detalhe do lote sempre terá mais fotos que
-            # respostas laterais de listagem/recomendados.
-            if kl in ("fotosurls", "fotos", "fotosurl", "photos", "images", "imagens"):
-                if isinstance(v, list):
+            # Imagens: só coleta no walk se NÃO tiver UUID.
+            # Com UUID, _find_fotos_for_uuid cuida disso depois — evita
+            # pegar fotos de outros lotes do mesmo batch (busca-elastic).
+            if not lot_uuid:
+                if kl in _FOTO_KEYS and isinstance(v, list):
                     urls_validas = [
                         u for u in v
                         if isinstance(u, str) and u.startswith("http")
@@ -464,18 +466,19 @@ def extract_api_fields(responses: list[dict], lot_uuid: str | None = None) -> di
 
     result = dict(extras)
 
-    # Fotos: se tiver UUID do lote, procura especificamente o objeto desse lote
-    # dentro de todas as respostas (resolve o bug do busca-elastic batch).
-    # Só usa a extração genérica (maior conjunto) se não encontrar pelo UUID.
+    # Fotos com UUID: busca o objeto exato do lote no JSON do batch.
+    # [] = lote encontrado mas sem fotos → não usa fallback (evita imagens de outro lote).
+    # None = lote não encontrado no JSON → mantém o que o walk achou (sem UUID, sem batch).
     if lot_uuid:
         fotos_por_uuid = None
         for cap in responses:
             fotos_por_uuid = _find_fotos_for_uuid(cap["data"], lot_uuid)
-            if fotos_por_uuid:
+            if fotos_por_uuid is not None:  # achou (com ou sem fotos)
                 break
-        if fotos_por_uuid:
+        if fotos_por_uuid:             # lista com URLs → usa
             result["fotos_api"] = fotos_por_uuid
-        # se não achou pelo UUID, mantém o que o walk encontrou (fallback)
+        elif fotos_por_uuid is not None:  # lista vazia → lote sem fotos, não contamina
+            result.pop("fotos_api", None)
 
     if lance_candidates:
         lance_candidates.sort(key=lambda x: x[0], reverse=True)
