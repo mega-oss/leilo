@@ -41,7 +41,7 @@ CATEGORIAS = {
     "carros":      ("Carros",      "carro"),
     "motos":       ("Motos",       "moto"),
     "pesados":     ("Pesados",     "caminhao"),
-    "utilitarios": ("Utilitários", "van"),
+    "utilitarios": ("Utilitários", "pickup"),
     "sucatas":     ("Sucatas",     "sucata"),
 }
 
