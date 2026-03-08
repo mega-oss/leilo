@@ -451,9 +451,48 @@ def _extract_item(item: dict) -> dict | None:
         item.get("dtFim") or item.get("endDate")
     )
 
-    # Link — monta com lelId numérico
-    lel_id = item.get("lelId") or item.get("id") or uuid
-    link = f"https://leilo.com.br/lote/{lel_id}"
+    # Link — monta slug completo igual ao leilo usa nas URLs reais
+    # Formato: /leilao/{cidade-estado}/{categoria}/{marca}/{modelo}/ano.{ano}/{uuid}
+    def _slugify(s: str) -> str:
+        s = str(s).lower().strip()
+        s = re.sub(r"[àáâãä]", "a", s)
+        s = re.sub(r"[èéêë]", "e", s)
+        s = re.sub(r"[ìíîï]", "i", s)
+        s = re.sub(r"[òóôõö]", "o", s)
+        s = re.sub(r"[ùúûü]", "u", s)
+        s = re.sub(r"[ç]", "c", s)
+        s = re.sub(r"[ñ]", "n", s)
+        s = re.sub(r"[^a-z0-9]+", "-", s)
+        return s.strip("-")
+
+    _ESTADO_SLUG = {
+        "AC":"acre","AL":"alagoas","AP":"amapa","AM":"amazonas","BA":"bahia",
+        "CE":"ceara","DF":"distrito-federal","ES":"espirito-santo","GO":"goias",
+        "MA":"maranhao","MT":"mato-grosso","MS":"mato-grosso-do-sul","MG":"minas-gerais",
+        "PA":"para","PB":"paraiba","PR":"parana","PE":"pernambuco","PI":"piaui",
+        "RJ":"rio-de-janeiro","RN":"rio-grande-do-norte","RS":"rio-grande-do-sul",
+        "RO":"rondonia","RR":"roraima","SC":"santa-catarina","SP":"sao-paulo",
+        "SE":"sergipe","TO":"tocantins",
+    }
+
+    cat_map = {
+        "Carros": "carros", "Motos": "motos", "Pesados": "pesados",
+        "Utilitários": "utilitarios", "Sucatas": "sucatas",
+    }
+    cat_slug = cat_map.get(item.get("tipo", ""), "carros")
+
+    cidade_raw = loc_obj.get("cidade", "") if isinstance(loc_obj, dict) else ""
+    estado_raw = loc_obj.get("estado", "") if isinstance(loc_obj, dict) else ""
+    cidade_slug = _slugify(cidade_raw)
+    estado_slug = _ESTADO_SLUG.get(estado_raw.upper(), _slugify(estado_raw))
+    local_slug  = f"{cidade_slug}-{estado_slug}".strip("-") or "brasil"
+
+    marca_slug  = _slugify(marca or "")
+    modelo_slug = _slugify(modelo or "")
+    ano_slug    = f"ano.{ano_fab}" if ano_fab else ""
+
+    slug_parts  = [p for p in [local_slug, cat_slug, marca_slug, modelo_slug, ano_slug, uuid] if p]
+    link = "https://leilo.com.br/leilao/" + "/".join(slug_parts)
 
     # Desconto e margem
     desc_pct = pct_desconto(lance_raw, mercado_raw)
