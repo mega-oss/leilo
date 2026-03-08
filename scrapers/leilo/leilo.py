@@ -42,7 +42,7 @@ CATEGORIAS = {
     "motos":       ("Motos",       "moto"),
     "pesados":     ("Pesados",     "caminhao"),
     "utilitarios": ("Utilitários", "pickup"),
-    "sucatas":     ("Sucatas",     "sucata"),
+    "sucatas":     ("Sucatas",     "outro"),
 }
 
 BASE_URL = "https://leilo.com.br/leilao/carros"
@@ -175,7 +175,7 @@ def normalize_to_db(lote: dict, tipo: str) -> dict | None:
         return None
 
     lance = lote.get("lance_raw")
-    if not lance:
+    if not lance and tipo != "outro":
         return None
 
     ano_fab, ano_mod = parse_ano(lote.get("ano"))
@@ -183,7 +183,7 @@ def normalize_to_db(lote: dict, tipo: str) -> dict | None:
         m = re.search(r"\b(19[5-9]\d|20[0-3]\d)\b", titulo)
         if m:
             ano_fab = ano_mod = int(m.group(1))
-        else:
+        elif tipo != "outro":
             return None
 
     data_enc = parse_data(lote.get("data_encerramento"))
@@ -627,19 +627,32 @@ async def fetch_categoria(
 
 # ─── Filtragem ────────────────────────────────────────────────────────────────
 
-def filtrar_lotes(lotes: list[dict]) -> tuple[list[dict], int, int]:
+def filtrar_lotes(lotes: list[dict], tipo: str = "") -> tuple[list[dict], int, int]:
     ok, sem_lance, lixo = [], 0, 0
+    is_sucata = (tipo == "outro")  # sucatas mapeadas para "outro"
+
     for lote in lotes:
+        # Sucatas: só exige imagem (sem lance e sem margem obrigatórios)
+        if is_sucata:
+            if not lote.get("imagens"):
+                lixo += 1
+                continue
+            ok.append(lote)
+            continue
+
+        # Demais: exige lance
         if not lote.get("lance_raw"):
             sem_lance += 1
             continue
+
+        # Exige imagem
         if not lote.get("imagens"):
             lixo += 1
             continue
-        if lote.get("margem_revenda") is None:
-            lixo += 1
-            continue
+
+        # Sem margem calculável → inclui mesmo assim (teste)
         ok.append(lote)
+
     return ok, sem_lance, lixo
 
 
@@ -748,7 +761,7 @@ async def main():
             lotes_raw = await fetch_categoria(client, cat_api, args.max, args.debug, url_filtros)
             print(f"  {GREEN}✓  {len(lotes_raw)} lotes retornados pela API{RESET}")
 
-            lotes, sem_lance, lixo = filtrar_lotes(lotes_raw)
+            lotes, sem_lance, lixo = filtrar_lotes(lotes_raw, tipo)
 
             if sem_lance:
                 print(f"  {DIM}⏭  {sem_lance} sem lance ativo{RESET}")
