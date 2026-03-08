@@ -270,30 +270,74 @@ async def get_session_cookies(show: bool = False) -> dict:
 
 # ─── Payload busca-elastic ────────────────────────────────────────────────────
 
-def _build_payload(categoria_api: str, offset: int, size: int) -> dict:
+# ─── Parse de URL ─────────────────────────────────────────────────────────────
+
+def parse_leilo_url(url: str) -> dict:
+    """
+    Extrai categoria e filtros de qualquer URL de listagem do leilo.
+    Ex: https://leilo.com.br/leilao/carros/de.2018/ate.2026?veiculo.anoModelo=2018|2026&veiculo.km=1|147564
+    """
+    from urllib.parse import urlparse, parse_qs, unquote as _unquote
+
+    CAT_MAP = {
+        "carros":      "Carros",
+        "motos":       "Motos",
+        "pesados":     "Pesados",
+        "utilitarios": "Utilitários",
+        "sucatas":     "Sucatas",
+    }
+    LABEL_MAP = {
+        "veiculo.anoModelo": "Ano",
+        "veiculo.km":        "KM",
+        "veiculo.marca":     "Marca",
+        "veiculo.modelo":    "Modelo",
+    }
+
+    parsed  = urlparse(url)
+    parts   = parsed.path.strip("/").split("/")
+    cat_path = parts[1] if len(parts) > 1 else "carros"
+    cat_api  = CAT_MAP.get(cat_path, "Carros")
+
+    filtros = [
+        {"campo": "tipo", "tipo": "exata", "label": "Tipo", "valor": cat_api}
+    ]
+
+    for campo, vals in parse_qs(parsed.query).items():
+        val   = _unquote(vals[0])
+        label = LABEL_MAP.get(campo, campo)
+        if "|" in val:
+            mn_s, mx_s = val.split("|", 1)
+            def _to_num(s):
+                try: return int(s)
+                except ValueError:
+                    try: return float(s)
+                    except: return s
+            filtros.append({
+                "campo": campo, "tipo": "range", "label": label,
+                "range": {"min": _to_num(mn_s), "max": _to_num(mx_s)}
+            })
+        else:
+            filtros.append({"campo": campo, "tipo": "exata", "label": label, "valor": val})
+
+    return {
+        "categoria_path": cat_path,
+        "categoria_api":  cat_api,
+        "base_url":       url.split("?")[0],
+        "filtros":        filtros,
+    }
+
+
+def _build_payload(categoria_api: str, offset: int, size: int, filtros: list | None = None) -> dict:
+    if filtros is None:
+        filtros = [
+            {"campo": "tipo",              "tipo": "exata", "label": "Tipo", "valor": categoria_api},
+            {"campo": "veiculo.anoModelo", "tipo": "range", "label": "Ano",  "range": {"min": 2018, "max": 2026}},
+            {"campo": "veiculo.km",        "tipo": "range", "label": "KM",   "range": {"min": 1,    "max": 200000}},
+        ]
     return {
         "from": offset,
         "size": size,
-        "requisicoesBusca": [
-            {
-                "campo": "tipo",
-                "tipo":  "exata",
-                "label": "Tipo",
-                "valor": categoria_api,
-            },
-            {
-                "campo": "veiculo.anoModelo",
-                "tipo":  "range",
-                "label": "Ano",
-                "range": {"min": "2018", "max": 2026},
-            },
-            {
-                "campo": "veiculo.km",
-                "tipo":  "range",
-                "label": "KM",
-                "range": {"min": 1, "max": 200000},
-            },
-        ],
+        "requisicoesBusca": filtros,
         "listaOrdenacao": [
             {"campo": "dataFim", "tipoCampo": "long", "tipoOrdenacao": "asc"}
         ],
@@ -437,6 +481,7 @@ async def fetch_categoria(
     categoria_api: str,
     max_lotes: int = 999,
     debug: bool = False,
+    filtros: list | None = None,
 ) -> list[dict]:
     PAGE_SIZE = 48
     offset    = 0
@@ -444,7 +489,7 @@ async def fetch_categoria(
     total_api = None
 
     while True:
-        payload = _build_payload(categoria_api, offset, PAGE_SIZE)
+        payload = _build_payload(categoria_api, offset, PAGE_SIZE, filtros)
         try:
             resp = await client.post(API_URL, json=payload, timeout=30)
             resp.raise_for_status()
@@ -587,6 +632,7 @@ async def main():
     parser.add_argument("--output",    "-o", default="lotes.json")
     parser.add_argument("--no-upload", action="store_true", help="Não sobe pro Supabase")
     parser.add_argument("--show",      action="store_true", help="Browser visível pra cookies")
+    parser.add_argument("--url",      type=str, default=None, help="URL do leilo para extrair filtros (sobrepõe --categoria)")
     parser.add_argument("--debug",     action="store_true", help="Mostra respostas brutas da API")
     parser.add_argument("--max",       type=int, default=999, help="Máx lotes por categoria")
     args = parser.parse_args()
@@ -622,7 +668,7 @@ async def main():
             print(f"{BOLD}{'─'*64}{RESET}")
 
             print(f"  {CYAN}Consultando API...{RESET}")
-            lotes_raw = await fetch_categoria(client, cat_api, args.max, args.debug)
+            lotes_raw = await fetch_categoria(client, cat_api, args.max, args.debug, url_filtros)
             print(f"  {GREEN}✓  {len(lotes_raw)} lotes retornados pela API{RESET}")
 
             lotes, sem_lance, lixo = filtrar_lotes(lotes_raw)

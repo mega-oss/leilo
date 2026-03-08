@@ -1,26 +1,42 @@
 #!/usr/bin/env python3
 """
-debug_json.py — Testa payloads na busca-elastic e salva o JSON bruto.
+leilo_debug_imagens.py — Inspeciona como as imagens vêm na API do leilo
+
+Busca alguns lotes e imprime tudo relacionado a imagens:
+  - Todos os campos com "foto", "img", "image", "url" no nome
+  - Estrutura completa do item raw (JSON salvo em debug_raw.json)
 
 Uso:
-    python debug_json.py              # testa payload sem filtro (pega o que vier)
-    python debug_json.py --raw        # salva raw.json com os primeiros 3 itens completos
-    python debug_json.py --tipos      # lista todos os valores únicos de "tipo" nos resultados
-    python debug_json.py --campos     # lista todas as keys de veiculo.* nos resultados
+    python leilo_debug_imagens.py                    # 5 lotes de carros
+    python leilo_debug_imagens.py --categoria motos  # outra categoria
+    python leilo_debug_imagens.py --max 10           # mais lotes
+    python leilo_debug_imagens.py --show             # browser visível
 """
 
 import asyncio
 import httpx
 import json
+import re
+import sys
 import argparse
+from pathlib import Path
 from playwright.async_api import async_playwright
 
-API_URL  = "https://api.leilo.com.br/v1/lote/busca-elastic"
-BASE_URL = "https://leilo.com.br/leilao/carros"
+# ─── Cores ────────────────────────────────────────────────────────────────────
+CYAN   = "\033[96m"
+GREEN  = "\033[92m"
+YELLOW = "\033[93m"
+RED    = "\033[91m"
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+DIM    = "\033[2m"
 
-HEADERS = {
+BASE_URL = "https://leilo.com.br/leilao/carros"
+API_URL  = "https://api.leilo.com.br/v1/lote/busca-elastic"
+
+API_HEADERS = {
     "accept":          "application/json, text/plain, */*",
-    "accept-language": "pt-BR,pt;q=0.9",
+    "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
     "content-type":    "application/json",
     "origin":          "https://leilo.com.br",
     "referer":         "https://leilo.com.br/",
@@ -31,82 +47,19 @@ HEADERS = {
     ),
 }
 
-# Payloads a testar em sequência até achar carros
-PAYLOADS_TESTE = [
-    {
-        "nome": "Sem filtro (size=5)",
-        "payload": {
-            "from": 0, "size": 5,
-            "listaOrdenacao": [{"campo": "dataFim", "tipoCampo": "long", "tipoOrdenacao": "asc"}]
-        }
-    },
-    {
-        "nome": "Filtro tipo=Veículos (campo raiz)",
-        "payload": {
-            "from": 0, "size": 5,
-            "requisicoesBusca": [
-                {"tipo": "exata", "campo": "tipo", "label": "Tipo", "valor": "Veículos"}
-            ],
-            "listaOrdenacao": [{"campo": "dataFim", "tipoCampo": "long", "tipoOrdenacao": "asc"}]
-        }
-    },
-    {
-        "nome": "Filtro tipo=Veiculo (sem acento)",
-        "payload": {
-            "from": 0, "size": 5,
-            "requisicoesBusca": [
-                {"tipo": "exata", "campo": "tipo", "label": "Tipo", "valor": "Veiculo"}
-            ],
-            "listaOrdenacao": [{"campo": "dataFim", "tipoCampo": "long", "tipoOrdenacao": "asc"}]
-        }
-    },
-    {
-        "nome": "Filtro tipo=VEICULO (maiúsculo)",
-        "payload": {
-            "from": 0, "size": 5,
-            "requisicoesBusca": [
-                {"tipo": "exata", "campo": "tipo", "label": "Tipo", "valor": "VEICULO"}
-            ],
-            "listaOrdenacao": [{"campo": "dataFim", "tipoCampo": "long", "tipoOrdenacao": "asc"}]
-        }
-    },
-    {
-        "nome": "Filtro veiculo.categoria=CARRO (original)",
-        "payload": {
-            "from": 0, "size": 5,
-            "requisicoesBusca": [
-                {"tipo": "exata", "campo": "veiculo.categoria", "label": "Categoria", "valor": "CARRO"}
-            ],
-            "listaOrdenacao": [{"campo": "dataFim", "tipoCampo": "long", "tipoOrdenacao": "asc"}]
-        }
-    },
-    {
-        "nome": "Filtro anoModelo intervalo 2018-2026 (sem categoria)",
-        "payload": {
-            "from": 0, "size": 5,
-            "requisicoesBusca": [
-                {"tipo": "intervalo", "campo": "veiculo.anoModelo", "label": "Ano",
-                 "valorMinimo": "2018", "valorMaximo": "2026"},
-            ],
-            "listaOrdenacao": [{"campo": "dataFim", "tipoCampo": "long", "tipoOrdenacao": "asc"}]
-        }
-    },
-    {
-        "nome": "Filtro km intervalo 0-200000 (sem categoria)",
-        "payload": {
-            "from": 0, "size": 5,
-            "requisicoesBusca": [
-                {"tipo": "intervalo", "campo": "veiculo.km", "label": "KM",
-                 "valorMinimo": "0", "valorMaximo": "200000"},
-            ],
-            "listaOrdenacao": [{"campo": "dataFim", "tipoCampo": "long", "tipoOrdenacao": "asc"}]
-        }
-    },
-]
+CATEGORIAS = {
+    "carros":      "Carros",
+    "motos":       "Motos",
+    "pesados":     "Pesados",
+    "utilitarios": "Utilitários",
+    "sucatas":     "Sucatas",
+}
 
 
-async def get_cookies(show: bool) -> dict:
-    print("  Abrindo browser pra pegar cookies...")
+# ─── Cookies via Playwright ───────────────────────────────────────────────────
+
+async def get_session_cookies(show: bool = False) -> dict:
+    print(f"  {DIM}Obtendo cookies via browser...{RESET}")
     cookies = {}
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -114,140 +67,177 @@ async def get_cookies(show: bool) -> dict:
             args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
         )
         ctx = await browser.new_context(
-            user_agent=HEADERS["user-agent"],
+            user_agent=API_HEADERS["user-agent"],
             viewport={"width": 390, "height": 844},
             locale="pt-BR",
-            bypass_csp=True,
-        )
-        await ctx.add_init_script(
-            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
         )
         page = await ctx.new_page()
         try:
             await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(3)
-        except Exception as e:
-            print(f"  browser erro: {e}")
+        except Exception:
+            pass
         raw = await ctx.cookies()
         cookies = {c["name"]: c["value"] for c in raw}
         await browser.close()
-    print(f"  ✓ {len(cookies)} cookies: {list(cookies.keys())}\n")
+    print(f"  {GREEN}✓  {len(cookies)} cookies obtidos{RESET}\n")
     return cookies
 
 
-async def bater(client: httpx.AsyncClient, nome: str, payload: dict) -> list:
-    print(f"  ▶ {nome}")
-    try:
-        resp = await client.post(API_URL, json=payload, timeout=20)
-        print(f"    status={resp.status_code}  bytes={len(resp.content)}")
-        if resp.status_code not in (200, 201):
-            print(f"    ❌ HTTP {resp.status_code}: {resp.text[:200]}")
-            return []
-        data = resp.json()
-        items = data if isinstance(data, list) else []
-        if isinstance(data, dict):
-            for k in ["lotes", "items", "results", "data", "content", "hits"]:
-                if isinstance(data.get(k), list):
-                    items = data[k]
-                    break
-            if not items:
-                for k, v in data.items():
-                    if isinstance(v, list):
-                        items = v
-                        break
-        print(f"    itens={len(items)}")
-        if items:
-            tipos = {}
-            for it in items:
-                t = it.get("tipo", "?")
-                tipos[t] = tipos.get(t, 0) + 1
-            print(f"    tipos: {tipos}")
-        return items
-    except Exception as e:
-        print(f"    ❌ erro: {e}")
-        return []
+# ─── Busca raw (sem filtrar nada) ─────────────────────────────────────────────
 
+async def fetch_raw(client: httpx.AsyncClient, categoria_api: str, n: int) -> list[dict]:
+    payload = {
+        "from": 0,
+        "size": n,
+        "requisicoesBusca": [
+            {"campo": "tipo", "tipo": "exata", "label": "Tipo", "valor": categoria_api}
+        ],
+        "listaOrdenacao": [
+            {"campo": "dataFim", "tipoCampo": "long", "tipoOrdenacao": "asc"}
+        ],
+    }
+    resp = await client.post(API_URL, json=payload, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, list):
+        return data
+    for key in ["lotes", "items", "results", "data", "content", "hits"]:
+        if isinstance(data.get(key), list):
+            return data[key]
+    return []
+
+
+# ─── Encontra recursivamente todos os campos de imagem num dict ───────────────
+
+IMAGE_KEYWORDS = re.compile(r"foto|img|imag|url|photo|picture|thumb|banner|midia|media", re.I)
+
+def find_image_fields(obj, path="", results=None):
+    if results is None:
+        results = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            full_path = f"{path}.{k}" if path else k
+            if IMAGE_KEYWORDS.search(k):
+                results[full_path] = v
+            find_image_fields(v, full_path, results)
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            find_image_fields(v, f"{path}[{i}]", results)
+    return results
+
+
+# ─── Impressão de debug ───────────────────────────────────────────────────────
+
+def print_item_debug(item: dict, idx: int):
+    titulo = (
+        item.get("nome") or item.get("tituloProduto") or
+        item.get("nomeProduto") or f"item_{idx}"
+    )
+    lel_id = item.get("lelId") or item.get("id") or "?"
+
+    print(f"\n{'─'*70}")
+    print(f"{BOLD}{YELLOW}[{idx}] {titulo}{RESET}")
+    print(f"{DIM}    lelId: {lel_id}{RESET}")
+    print(f"{'─'*70}")
+
+    # ── Campos de imagem encontrados ─────────────────────────────────────────
+    img_fields = find_image_fields(item)
+    if img_fields:
+        print(f"\n  {CYAN}{BOLD}Campos de imagem encontrados:{RESET}")
+        for path, val in img_fields.items():
+            if isinstance(val, list):
+                print(f"\n  {GREEN}{path}{RESET}  →  lista com {len(val)} itens")
+                for i, v in enumerate(val[:5]):  # mostra até 5
+                    print(f"      [{i}]  {v}")
+                if len(val) > 5:
+                    print(f"      {DIM}... (+{len(val)-5} omitidos){RESET}")
+            elif isinstance(val, str) and val:
+                print(f"  {GREEN}{path}{RESET}  →  {val}")
+            elif val is not None:
+                print(f"  {GREEN}{path}{RESET}  →  {repr(val)}")
+    else:
+        print(f"\n  {RED}⚠  Nenhum campo de imagem encontrado neste item{RESET}")
+
+    # ── Campos do sub-dict "veiculo" (resumo) ────────────────────────────────
+    veiculo = item.get("veiculo") or {}
+    if veiculo:
+        veiculo_keys = list(veiculo.keys())
+        print(f"\n  {DIM}Keys em item.veiculo: {veiculo_keys}{RESET}")
+
+    # ── Todas as keys do item raiz ────────────────────────────────────────────
+    print(f"\n  {DIM}Keys raiz: {list(item.keys())}{RESET}")
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 async def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--show",   action="store_true")
-    parser.add_argument("--raw",    action="store_true", help="Salva raw.json com 3 itens do melhor payload")
-    parser.add_argument("--tipos",  action="store_true", help="Lista valores únicos de 'tipo'")
-    parser.add_argument("--campos", action="store_true", help="Lista keys de veiculo.* e valor.*")
+    parser = argparse.ArgumentParser(description="Debug de imagens da API do leilo")
+    parser.add_argument("--categoria", choices=list(CATEGORIAS.keys()), default="carros")
+    parser.add_argument("--max",  type=int, default=5, help="Qtd de lotes a inspecionar")
+    parser.add_argument("--show", action="store_true", help="Browser visível")
+    parser.add_argument("--output", default="debug_raw.json", help="Arquivo JSON com os raws")
     args = parser.parse_args()
 
-    cookies = await get_cookies(args.show)
+    cat_api = CATEGORIAS[args.categoria]
 
-    print("=" * 60)
-    print("TESTANDO PAYLOADS")
-    print("=" * 60)
+    print(f"\n{BOLD}{'═'*70}{RESET}")
+    print(f"{BOLD}  🔍  LEILO DEBUG — IMAGENS  ({args.categoria.upper()}  ·  {args.max} lotes){RESET}")
+    print(f"{BOLD}{'═'*70}{RESET}\n")
 
-    best_items = []
-    best_nome  = ""
+    cookies = await get_session_cookies(show=args.show)
 
-    async with httpx.AsyncClient(headers=HEADERS, cookies=cookies, follow_redirects=True) as client:
-        for t in PAYLOADS_TESTE:
-            items = await bater(client, t["nome"], t["payload"])
-            if len(items) > len(best_items):
-                best_items = items
-                best_nome  = t["nome"]
-            print()
+    async with httpx.AsyncClient(
+        headers=API_HEADERS,
+        cookies=cookies,
+        follow_redirects=True,
+    ) as client:
+        items = await fetch_raw(client, cat_api, args.max)
 
-    print("=" * 60)
-    print(f"MELHOR PAYLOAD: {best_nome}  ({len(best_items)} itens)")
-    print("=" * 60)
+    print(f"  {GREEN}✓  {len(items)} itens retornados pela API{RESET}")
 
-    if not best_items:
-        print("❌ Nenhum payload retornou itens!")
+    if not items:
+        print(f"  {RED}Nenhum item retornado. Tente --show para ver o browser.{RESET}")
         return
 
-    if args.tipos:
-        print("\nVALORES ÚNICOS DE 'tipo':")
-        tipos = {}
-        for it in best_items:
-            t = it.get("tipo", "?")
-            tipos[t] = tipos.get(t, 0) + 1
-        for k, v in sorted(tipos.items(), key=lambda x: -x[1]):
-            print(f"  '{k}': {v}x")
+    # ── Salva JSON raw completo ───────────────────────────────────────────────
+    with open(args.output, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False, indent=2)
+    print(f"  {DIM}JSON raw salvo em: {args.output}{RESET}")
 
-    if args.campos:
-        print("\nKEYS DE veiculo.*:")
-        vkeys = set()
-        for it in best_items:
-            vkeys.update((it.get("veiculo") or {}).keys())
-        for k in sorted(vkeys):
-            vals = [str((it.get("veiculo") or {}).get(k, ""))[:30] for it in best_items[:3]]
-            print(f"  {k}: {vals}")
+    # ── Inspeciona cada item ──────────────────────────────────────────────────
+    for i, item in enumerate(items, 1):
+        print_item_debug(item, i)
 
-        print("\nKEYS DE valor.*:")
-        valkeys = set()
-        for it in best_items:
-            valkeys.update((it.get("valor") or {}).keys())
-        for k in sorted(valkeys):
-            vals = [str((it.get("valor") or {}).get(k, ""))[:30] for it in best_items[:3]]
-            print(f"  {k}: {vals}")
+    # ── Resumo geral: quais campos de imagem existem em TODOS os itens ────────
+    print(f"\n\n{'═'*70}")
+    print(f"{BOLD}  📊  RESUMO — campos de imagem por item{RESET}")
+    print(f"{'═'*70}")
 
-    if args.raw:
-        with open("raw.json", "w", encoding="utf-8") as f:
-            json.dump(best_items[:3], f, ensure_ascii=False, indent=2)
-        print("\n✓ Salvo em raw.json (primeiros 3 itens)")
+    campo_contagem: dict[str, int] = {}
+    campo_exemplos: dict[str, list] = {}
 
-    # Resumo do primeiro item
-    print("\nPRIMEIRO ITEM:")
-    it = best_items[0]
-    print(f"  nome:  {it.get('nome')}")
-    print(f"  tipo:  {it.get('tipo')}")
-    print(f"  id:    {it.get('id')}")
-    print(f"  lelId: {it.get('lelId')}")
-    vei = it.get("veiculo") or {}
-    print(f"  veiculo.categoria:    {vei.get('categoria', '—')}")
-    print(f"  veiculo.valorMercado: {vei.get('valorMercado')}")
-    print(f"  veiculo.anoModelo:    {vei.get('anoModelo')}")
-    print(f"  veiculo.infocarMarca: {vei.get('infocarMarca')}")
-    val = it.get("valor") or {}
-    lance = val.get("lance") or {}
-    print(f"  valor.lance.valor:    {lance.get('valor')}")
-    print(f"  fotosUrls:            {len(it.get('fotosUrls') or [])} fotos")
+    for item in items:
+        fields = find_image_fields(item)
+        for path, val in fields.items():
+            # Normaliza path removendo índices de array para agrupar
+            norm = re.sub(r"\[\d+\]", "[]", path)
+            campo_contagem[norm] = campo_contagem.get(norm, 0) + 1
+            if norm not in campo_exemplos and val:
+                exemplo = val[0] if isinstance(val, list) and val else val
+                if isinstance(exemplo, str):
+                    campo_exemplos[norm] = exemplo
+
+    for campo, count in sorted(campo_contagem.items(), key=lambda x: -x[1]):
+        bar = "█" * count + "░" * (len(items) - count)
+        exemplo = campo_exemplos.get(campo, "")
+        if isinstance(exemplo, str) and len(exemplo) > 60:
+            exemplo = exemplo[:57] + "..."
+        print(f"  {GREEN}{campo:<45}{RESET}  {bar}  {count}/{len(items)}")
+        if exemplo:
+            print(f"    {DIM}ex: {exemplo}{RESET}")
+
+    print(f"\n  {DIM}Veja o JSON completo em: {args.output}{RESET}\n")
 
 
 if __name__ == "__main__":
