@@ -329,7 +329,7 @@ def _build_payload(categoria_api: str, offset: int, size: int, filtros: list | N
     if filtros is None:
         filtros = [
             {"campo": "tipo",              "tipo": "exata", "label": "Tipo", "valor": categoria_api},
-            {"campo": "veiculo.anoModelo", "tipo": "range", "label": "Ano",  "range": {"min": 2018, "max": 2026}},
+            {"campo": "veiculo.anoModelo", "tipo": "range", "label": "Ano",  "range": {"min": 2015, "max": 2026}},
             {"campo": "veiculo.km",        "tipo": "range", "label": "KM",   "range": {"min": 1,    "max": 200000}},
         ]
     return {
@@ -375,16 +375,25 @@ def _extract_item(item: dict) -> dict | None:
     if not titulo:
         return None
 
-    # Lance atual — item["valor"]["lance"]["valor"]
+    # Lance atual — ordem de prioridade:
+    # 1. lance.valor (lance atual do leilão — mais confiável)
+    # 2. valorProposta (proposta atual)
+    # 3. minimo (lance mínimo de abertura — fallback seguro)
     lance_raw = None
     v = lance_d.get("valor")
     if v is not None:
         lance_raw = parse_brl(v)
-    # fallback: valorProposta
     if not lance_raw:
         v = valor.get("valorProposta")
         if v is not None:
             lance_raw = parse_brl(v)
+    if not lance_raw:
+        v = valor.get("minimo")
+        if v is not None:
+            lance_raw = parse_brl(v)
+    # Rejeita valores absurdamente baixos (depósitos, taxas, etc.)
+    if lance_raw and lance_raw < 10_000:
+        lance_raw = None
 
     # Custo total real = lance + comissão + despachante + remoção + depósito + vistoria
     # A API já calcula isso em valor.totalAPagar — muito mais preciso que flat R$15k
