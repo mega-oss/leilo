@@ -386,6 +386,25 @@ def _extract_item(item: dict) -> dict | None:
         if v is not None:
             lance_raw = parse_brl(v)
 
+    # Custo total real = lance + comissão + despachante + remoção + depósito + vistoria
+    # A API já calcula isso em valor.totalAPagar — muito mais preciso que flat R$15k
+    total_a_pagar = None
+    v = valor.get("totalAPagar")
+    if v is not None:
+        try:
+            total_a_pagar = float(v)
+            if total_a_pagar <= 0:
+                total_a_pagar = None
+        except (ValueError, TypeError):
+            total_a_pagar = None
+    # fallback: lance + totalDespesas
+    if not total_a_pagar and lance_raw:
+        despesas = valor.get("totalDespesas") or 0
+        try:
+            total_a_pagar = lance_raw + float(despesas)
+        except (ValueError, TypeError):
+            total_a_pagar = lance_raw
+
     # FIPE — item["veiculo"]["valorMercado"] (0 para não-veículos)
     mercado_raw = None
     v = veiculo.get("valorMercado")
@@ -439,8 +458,8 @@ def _extract_item(item: dict) -> dict | None:
     # Desconto e margem
     desc_pct = pct_desconto(lance_raw, mercado_raw)
     margem_revenda = None
-    if mercado_raw and lance_raw:
-        margem = round(mercado_raw - lance_raw - 15_000, 2)
+    if mercado_raw and total_a_pagar:
+        margem = round(mercado_raw - total_a_pagar, 2)
         margem_revenda = margem if margem >= 10_000 else None
 
     ano_str = (
