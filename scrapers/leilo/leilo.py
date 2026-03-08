@@ -268,8 +268,6 @@ async def get_session_cookies(show: bool = False) -> dict:
     return cookies
 
 
-# ─── Payload busca-elastic ────────────────────────────────────────────────────
-
 # ─── Parse de URL ─────────────────────────────────────────────────────────────
 
 def parse_leilo_url(url: str) -> dict:
@@ -632,19 +630,31 @@ async def main():
     parser.add_argument("--output",    "-o", default="lotes.json")
     parser.add_argument("--no-upload", action="store_true", help="Não sobe pro Supabase")
     parser.add_argument("--show",      action="store_true", help="Browser visível pra cookies")
-    parser.add_argument("--url",      type=str, default=None, help="URL do leilo para extrair filtros (sobrepõe --categoria)")
+    parser.add_argument("--url",       type=str, default=None, help="URL do leilo para extrair filtros (sobrepõe --categoria)")
     parser.add_argument("--debug",     action="store_true", help="Mostra respostas brutas da API")
     parser.add_argument("--max",       type=int, default=999, help="Máx lotes por categoria")
     args = parser.parse_args()
 
-    if not args.all and not args.categoria:
-        parser.error("Use --all ou --categoria <nome>")
+    if not args.all and not args.categoria and not args.url:
+        parser.error("Use --all, --categoria <nome> ou --url <url>")
 
     targets = (
         list(CATEGORIAS.items())
         if args.all
-        else [(args.categoria, CATEGORIAS[args.categoria])]
+        else [(args.categoria or "carros", CATEGORIAS.get(args.categoria or "carros", ("Carros", "carro")))]
     )
+
+    # ✅ Extrai filtros da URL se fornecida, senão None (usa filtros padrão da categoria)
+    url_filtros = None
+    if args.url:
+        parsed_url = parse_leilo_url(args.url)
+        url_filtros = parsed_url["filtros"]
+        # Sobrepõe targets com a categoria detectada na URL
+        cat_path = parsed_url["categoria_path"]
+        if cat_path in CATEGORIAS:
+            targets = [(cat_path, CATEGORIAS[cat_path])]
+        print(f"  {CYAN}Filtros extraídos da URL:{RESET}")
+        print(f"  {DIM}{json.dumps(url_filtros, ensure_ascii=False, indent=2)}{RESET}\n")
 
     print(f"\n{BOLD}{'═'*64}{RESET}")
     print(f"{BOLD}  🚗  LEILO API SCRAPER → auctions.veiculos{RESET}")
