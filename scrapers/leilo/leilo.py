@@ -548,25 +548,40 @@ DOM_JS = """
     }
 
     // Imagens do veículo
-    const imgSelectors = [
-        '[class*="foto-veiculo"] img',
-        '[class*="galeria"] img',
-        '[class*="carousel"] img',
-        '[class*="slider"] img',
-        '[class*="vehicle-image"] img',
-        '.q-carousel img',
-    ];
     const imgSeen = new Set();
-    for (const s of imgSelectors) {
-        document.querySelectorAll(s).forEach(img => {
-            const src = img.src || img.dataset.src || '';
+
+    // 1ª tentativa: background-image em .q-img__image (padrão do leilo)
+    document.querySelectorAll('.q-img__image, [class*="q-img__image"]').forEach(el => {
+        const bg = el.style.backgroundImage || window.getComputedStyle(el).backgroundImage || '';
+        const m = bg.match(/url\(["']?([^"')]+)["']?\)/);
+        if (m) {
+            const src = m[1];
             if (src && !imgSeen.has(src) && !src.includes('placeholder')
                      && !src.includes('logo') && src.startsWith('http')) {
                 imgSeen.add(src);
                 out.imagens.push(src);
             }
-        });
-        if (out.imagens.length >= 3) break;
+        }
+    });
+
+    // 2ª tentativa: <img src> nos carrosséis (fallback)
+    if (out.imagens.length === 0) {
+        const imgSelectors = [
+            '[class*="foto-veiculo"] img','[class*="galeria"] img',
+            '[class*="carousel"] img','[class*="slider"] img',
+            '[class*="vehicle-image"] img','.q-carousel img',
+        ];
+        for (const s of imgSelectors) {
+            document.querySelectorAll(s).forEach(img => {
+                const src = img.src || img.dataset.src || '';
+                if (src && !imgSeen.has(src) && !src.includes('placeholder')
+                         && !src.includes('logo') && src.startsWith('http')) {
+                    imgSeen.add(src);
+                    out.imagens.push(src);
+                }
+            });
+            if (out.imagens.length >= 3) break;
+        }
     }
 
     // Lote
