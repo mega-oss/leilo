@@ -504,11 +504,16 @@ def _extract_item(item: dict) -> dict | None:
     link = "https://leilo.com.br/leilao/" + "/".join(slug_parts)
 
     # Desconto e margem
+    is_moto = (cat_slug == "motos")
     desc_pct = pct_desconto(lance_raw, mercado_raw)
     margem_revenda = None
     if mercado_raw and total_a_pagar:
         margem = round(mercado_raw - total_a_pagar, 2)
-        margem_revenda = margem if margem >= 10_000 else None
+        if is_moto:
+            # Motos: sempre guarda margem (sem piso de R$10k — critério é % FIPE)
+            margem_revenda = margem
+        else:
+            margem_revenda = margem if margem >= 10_000 else None
 
     ano_str = (
         f"{ano_fab}/{ano_mod}"
@@ -520,12 +525,13 @@ def _extract_item(item: dict) -> dict | None:
         "uuid":              uuid,
         "url":               link,
         "titulo":            str(titulo).strip(),
+        "tipo_veiculo":      cat_slug,            # "motos", "carros", etc.
         "lance_raw":         lance_raw,
         "lance":             fmt_brl(lance_raw),
         "valor_mercado_raw": mercado_raw,
         "valor_mercado":     fmt_brl(mercado_raw),
         "desconto_pct":      desc_pct,
-        "desconto_label":    f"{desc_pct}% abaixo do mercado" if desc_pct else "—",
+        "desconto_label":    f"{desc_pct:.1f}% abaixo da FIPE" if desc_pct else "—",
         "margem_revenda":    margem_revenda,
         "imagens":           imagens,
         "ano":               ano_str,
@@ -630,6 +636,7 @@ async def fetch_categoria(
 def filtrar_lotes(lotes: list[dict], tipo: str = "") -> tuple[list[dict], int, int]:
     ok, sem_lance, lixo = [], 0, 0
     is_sucata = (tipo == "outro")  # sucatas mapeadas para "outro"
+    is_moto   = (tipo == "moto")
 
     for lote in lotes:
         # Sucatas: só exige imagem (sem lance e sem margem obrigatórios)
@@ -650,6 +657,15 @@ def filtrar_lotes(lotes: list[dict], tipo: str = "") -> tuple[list[dict], int, i
             lixo += 1
             continue
 
+        # Motos: critério é % abaixo da FIPE (>= 40%)
+        if is_moto:
+            desc = lote.get("desconto_pct") or 0
+            if desc < 40:
+                lixo += 1
+                continue
+            ok.append(lote)
+            continue
+
         # Sem margem calculável → inclui mesmo assim (teste)
         ok.append(lote)
 
@@ -657,18 +673,30 @@ def filtrar_lotes(lotes: list[dict], tipo: str = "") -> tuple[list[dict], int, i
 
 
 def print_lote(lote: dict, i: int, total: int):
-    titulo = (lote["titulo"] or "")[:50]
-    desc   = lote.get("desconto_pct") or 0
-    margem = lote.get("margem_revenda") or 0
-    n_imgs = len(lote.get("imagens") or [])
-    cor    = GREEN if desc >= 30 else YELLOW
-    prefix = f"  {DIM}[{i:>3}/{total}]{RESET}"
+    titulo   = (lote["titulo"] or "")[:50]
+    desc     = lote.get("desconto_pct") or 0
+    margem   = lote.get("margem_revenda") or 0
+    n_imgs   = len(lote.get("imagens") or [])
+    tipo_v   = lote.get("tipo_veiculo", "")
+    prefix   = f"  {DIM}[{i:>3}/{total}]{RESET}"
     print(f"{prefix} {YELLOW}{titulo}{RESET}")
-    print(f"         Lance {GREEN}{lote['lance']}{RESET}  ·  "
-          f"Mercado {lote['valor_mercado']}  ·  "
-          f"{cor}{lote['desconto_label']}{RESET}"
-          f"  ·  Margem {GREEN}R$ {margem:,.0f}{RESET}"
-          f"  ·  🖼 {n_imgs} fotos\n")
+
+    if tipo_v == "motos":
+        cor_fipe   = GREEN if desc >= 40 else YELLOW
+        cor_margem = GREEN if margem > 0 else RED
+        margem_str = f"R$ {margem:,.0f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        print(f"         Lance {GREEN}{lote['lance']}{RESET}  ·  "
+              f"FIPE {lote['valor_mercado']}  ·  "
+              f"{cor_fipe}{BOLD}{desc:.1f}% abaixo da FIPE{RESET}"
+              f"  ·  Margem {cor_margem}{margem_str}{RESET}"
+              f"  ·  🖼 {n_imgs} fotos\n")
+    else:
+        cor = GREEN if desc >= 30 else YELLOW
+        print(f"         Lance {GREEN}{lote['lance']}{RESET}  ·  "
+              f"Mercado {lote['valor_mercado']}  ·  "
+              f"{cor}{lote['desconto_label']}{RESET}"
+              f"  ·  Margem {GREEN}R$ {margem:,.0f}{RESET}"
+              f"  ·  🖼 {n_imgs} fotos\n")
 
 
 # ─── Upload para Supabase ─────────────────────────────────────────────────────
@@ -766,7 +794,7 @@ async def main():
             if sem_lance:
                 print(f"  {DIM}⏭  {sem_lance} sem lance ativo{RESET}")
             if lixo:
-                print(f"  {DIM}🗑  {lixo} descartados (sem imagem ou margem < R$10k){RESET}")
+                print(f"  {DIM}🗑  {lixo} descartados (sem imagem ou, para motos, < 40% abaixo da FIPE){RESET}")
             print(f"  {GREEN}✅  {len(lotes)} lotes aprovados{RESET}\n")
 
             for i, lote in enumerate(lotes, 1):
