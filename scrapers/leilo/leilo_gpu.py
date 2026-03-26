@@ -3,7 +3,7 @@
 leilo_gpu.py — Extrator de Placas de Vídeo do leilo.com.br → auctions.tecnologia
 
 Busca lotes na categoria Equipamentos, detecta placas de vídeo pelo título,
-busca o preço de mercado via scraping do Mercado Livre (Playwright) e
+busca o preço de mercado via API pública do Mercado Livre (sem Playwright) e
 faz upsert na tabela auctions.tecnologia do Supabase.
 
 Uso:
@@ -315,84 +315,19 @@ def normalize_to_db(gpu: dict) -> dict | None:
     }
 
 
-# ─── Busca de preço via Playwright (Mercado Livre scraping) ──────────────────
+# ─── Busca de preço via API pública do Mercado Livre ─────────────────────────
+# Usa api.mercadolibre.com/sites/MLB/search — sem autenticação, sem Playwright.
+# Funciona em CI/GitHub Actions sem ser bloqueado.
 
-async def _scrape_ml_precos(modelo: str, debug: bool = False) -> list:
-    query = f"placa de video {modelo}"
-    url   = (
-        "https://lista.mercadolivre.com.br/"
-        + query.replace(" ", "-")
-        + "_OrderId_PRICE_NoIndex_True"
-    )
-    precos = []
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
-        ctx = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            locale="pt-BR",
-            viewport={"width": 1280, "height": 900},
-        )
-        await ctx.add_init_script(
-            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-        )
-        page = await ctx.new_page()
-
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-            await asyncio.sleep(2)
-
-            seletores = [
-                "span.andes-money-amount__fraction",
-                ".price-tag-fraction",
-                "[class*='price'] [class*='fraction']",
-            ]
-
-            textos = []
-            for sel in seletores:
-                elementos = await page.query_selector_all(sel)
-                if elementos:
-                    for el in elementos:
-                        t = await el.inner_text()
-                        textos.append(t)
-                    if debug:
-                        print(f"  {DIM}[ML scrape] seletor={sel!r} → {len(textos)} valores{RESET}")
-                    break
-
-            if not textos:
-                html = await page.content()
-                textos = re.findall(r'"price"\s*:\s*(\d+(?:\.\d+)?)', html)
-                if debug:
-                    print(f"  {DIM}[ML scrape] fallback JSON-in-HTML → {len(textos)} matches{RESET}")
-
-        except Exception as e:
-            if debug:
-                print(f"  {RED}[ML scrape] erro playwright: {e}{RESET}")
-            textos = []
-        finally:
-            await browser.close()
-
-    for t in textos:
-        s = str(t).replace(".", "").replace(",", "").strip()
-        try:
-            v = float(s)
-            if 200 <= v <= 25_000:
-                precos.append(v)
-        except ValueError:
-            pass
-
-    return precos
+_ML_API = "https://api.mercadolibre.com/sites/MLB/search"
+_ML_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+}
 
 
 async def buscar_preco_mercadolivre(modelo: str, debug: bool = False) -> dict:
@@ -403,24 +338,64 @@ async def buscar_preco_mercadolivre(modelo: str, debug: bool = False) -> dict:
         + "_OrderId_PRICE_NoIndex_True"
     )
 
-    todos_precos = await _scrape_ml_precos(modelo, debug=debug)
+    params = {
+        "q":      query,
+        "limit":  50,
+        "sort":   "price_asc",
+        # Só produtos novos/usados vendidos por pessoa física ou loja (categoria Placas de Vídeo)
+        "category": "MLB1656",
+    }
 
-    if not todos_precos:
+    precos: list[float] = []
+
+    try:
+        async with httpx.AsyncClient(headers=_ML_HEADERS, timeout=20) as cli:
+            r = await cli.get(_ML_API, params=params)
+            if r.status_code != 200:
+                if debug:
+                    print(f"  {DIM}[ML API] HTTP {r.status_code}{RESET}")
+                # Fallback sem categoria fixa
+                params.pop("category", None)
+                r = await cli.get(_ML_API, params=params)
+
+            if r.status_code == 200:
+                data = r.json()
+                resultados = data.get("results") or []
+                if debug:
+                    print(f"  {DIM}[ML API] {len(resultados)} resultados para {query!r}{RESET}")
+
+                for item in resultados:
+                    preco = item.get("price")
+                    cond  = item.get("condition", "")
+                    # Aceita novos e usados; descarta outliers óbvios
+                    if preco and isinstance(preco, (int, float)):
+                        v = float(preco)
+                        if 200 <= v <= 30_000:
+                            precos.append(v)
+            else:
+                if debug:
+                    print(f"  {DIM}[ML API] falhou HTTP {r.status_code}{RESET}")
+
+    except Exception as e:
+        if debug:
+            print(f"  {RED}[ML API] erro: {e}{RESET}")
+
+    if not precos:
         return {
             "preco_medio":    None,
             "preco_min":      None,
             "preco_max":      None,
             "num_resultados": 0,
-            "fonte":          "mercadolivre_scrape",
+            "fonte":          "mercadolivre_api",
             "modelo_buscado": modelo,
             "url_busca":      url_busca,
         }
 
-    todos_precos.sort()
-    mediana   = todos_precos[len(todos_precos) // 2]
-    filtrados = [p for p in todos_precos if mediana * 0.25 <= p <= mediana * 3.5]
+    precos.sort()
+    mediana   = precos[len(precos) // 2]
+    filtrados = [p for p in precos if mediana * 0.30 <= p <= mediana * 3.0]
     if not filtrados:
-        filtrados = todos_precos
+        filtrados = precos
 
     preco_medio = round(sum(filtrados) / len(filtrados), 2)
 
@@ -429,7 +404,7 @@ async def buscar_preco_mercadolivre(modelo: str, debug: bool = False) -> dict:
         "preco_min":      min(filtrados),
         "preco_max":      max(filtrados),
         "num_resultados": len(filtrados),
-        "fonte":          "mercadolivre_scrape",
+        "fonte":          "mercadolivre_api",
         "modelo_buscado": modelo,
         "url_busca":      url_busca,
     }
