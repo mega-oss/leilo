@@ -329,58 +329,72 @@ _ML_HEADERS = {
     "Accept": "application/json",
 }
 
+# Queries tentadas em ordem — a primeira com resultado vence
+def _ml_queries(modelo: str) -> list[str]:
+    # Ex: "RTX 2060" → tenta do mais específico ao mais genérico
+    partes = modelo.strip().split()
+    queries = [
+        modelo,                       # "RTX 2060"
+        f"placa de video {modelo}",   # "placa de video RTX 2060"
+        f"GPU {modelo}",              # "GPU RTX 2060"
+    ]
+    # Se tem número (ex "2060"), tenta só o número como fallback
+    nums = [p for p in partes if p.isdigit() and len(p) >= 4]
+    if nums:
+        queries.append(f"placa video {nums[0]}")
+    return queries
+
 
 async def buscar_preco_mercadolivre(modelo: str, debug: bool = False) -> dict:
-    query     = f"placa de video {modelo}"
+    q_ref     = f"placa de video {modelo}"
     url_busca = (
         "https://lista.mercadolivre.com.br/"
-        + query.replace(" ", "-")
+        + q_ref.replace(" ", "-")
         + "_OrderId_PRICE_NoIndex_True"
     )
 
-    params = {
-        "q":      query,
-        "limit":  50,
-        "sort":   "price_asc",
-        # Só produtos novos/usados vendidos por pessoa física ou loja (categoria Placas de Vídeo)
-        "category": "MLB1656",
-    }
-
     precos: list[float] = []
+    query_usada = modelo
 
     try:
         async with httpx.AsyncClient(headers=_ML_HEADERS, timeout=20) as cli:
-            r = await cli.get(_ML_API, params=params)
-            if r.status_code != 200:
-                if debug:
-                    print(f"  {DIM}[ML API] HTTP {r.status_code}{RESET}")
-                # Fallback sem categoria fixa
-                params.pop("category", None)
-                r = await cli.get(_ML_API, params=params)
+            for query in _ml_queries(modelo):
+                params = {"q": query, "limit": 50, "sort": "price_asc"}
+                try:
+                    r = await cli.get(_ML_API, params=params)
+                    if debug:
+                        print(f"  {DIM}[ML API] query={query!r} → HTTP {r.status_code}{RESET}")
 
-            if r.status_code == 200:
-                data = r.json()
-                resultados = data.get("results") or []
-                if debug:
-                    print(f"  {DIM}[ML API] {len(resultados)} resultados para {query!r}{RESET}")
+                    if r.status_code != 200:
+                        continue
 
-                for item in resultados:
-                    preco = item.get("price")
-                    cond  = item.get("condition", "")
-                    # Aceita novos e usados; descarta outliers óbvios
-                    if preco and isinstance(preco, (int, float)):
-                        v = float(preco)
-                        if 200 <= v <= 30_000:
-                            precos.append(v)
-            else:
-                if debug:
-                    print(f"  {DIM}[ML API] falhou HTTP {r.status_code}{RESET}")
+                    resultados = r.json().get("results") or []
+                    if debug:
+                        print(f"  {DIM}[ML API] {len(resultados)} resultados{RESET}")
+
+                    for item in resultados:
+                        preco = item.get("price")
+                        if preco and isinstance(preco, (int, float)):
+                            v = float(preco)
+                            if 200 <= v <= 35_000:
+                                precos.append(v)
+
+                    if precos:
+                        query_usada = query
+                        break  # achou preços, não precisa tentar próxima query
+
+                except Exception as e:
+                    if debug:
+                        print(f"  {RED}[ML API] erro na query {query!r}: {e}{RESET}")
+                    continue
 
     except Exception as e:
         if debug:
-            print(f"  {RED}[ML API] erro: {e}{RESET}")
+            print(f"  {RED}[ML API] erro geral: {e}{RESET}")
 
     if not precos:
+        if debug:
+            print(f"  {YELLOW}[ML API] nenhum preço encontrado para {modelo!r}{RESET}")
         return {
             "preco_medio":    None,
             "preco_min":      None,
@@ -407,6 +421,7 @@ async def buscar_preco_mercadolivre(modelo: str, debug: bool = False) -> dict:
         "fonte":          "mercadolivre_api",
         "modelo_buscado": modelo,
         "url_busca":      url_busca,
+        "query_usada":    query_usada,
     }
 
 
