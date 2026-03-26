@@ -2,14 +2,28 @@ name: 🔵 Leilo - Coleta Completa
 
 on:
   workflow_dispatch:
+    inputs:
+      job:
+        description: 'Qual job rodar?'
+        required: false
+        default: 'todos'
+        type: choice
+        options:
+          - todos
+          - veiculos
+          - gpu
   schedule:
     - cron: '0 6 * * *'  # Diariamente às 6h UTC (3h BRT)
 
 jobs:
-  leilo-scraper:
-    name: 🔵 Leilo - Scrape + Upload Supabase
+  leilo-veiculos:
+    name: 🚗 Leilo - Veículos → auctions.veiculos
     runs-on: ubuntu-22.04
     timeout-minutes: 90
+    if: |
+      github.event_name == 'schedule' ||
+      inputs.job == 'todos' ||
+      inputs.job == 'veiculos'
 
     steps:
       - name: Checkout
@@ -35,7 +49,7 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/scrapers
         run: |
           echo "========================================"
-          echo "🔵 LEILO.COM.BR - COLETA COMPLETA"
+          echo "🔵 LEILO.COM.BR - VEÍCULOS"
           echo "========================================"
           echo "📅 Início: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           echo "🇧🇷 Horário Brasil: $(TZ='America/Sao_Paulo' date '+%Y-%m-%d %H:%M:%S BRT')"
@@ -45,31 +59,30 @@ jobs:
           echo "   • Carros"
           echo "   • Motos"
           echo "   • Caminhões"
-          echo "   • Ônibus"
-          echo "   • Máquinas"
-          echo "   • Equipamentos"
+          echo "   • Utilitários"
+          echo "   • Sucatas"
           echo ""
           echo "☁️  Destino: auctions.veiculos (Supabase)"
           echo "========================================"
 
           cd scrapers/leilo
-          python leilo.py --all --output /tmp/leilo_coleta.json
+          python leilo.py --all --output /tmp/leilo_veiculos.json
 
           echo ""
-          echo "✅ Leilo concluído: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "✅ Leilo veículos concluído: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
       - name: Upload JSON (Debug)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: leilo-${{ github.run_number }}
-          path: /tmp/leilo_coleta.json
+          name: leilo-veiculos-${{ github.run_number }}
+          path: /tmp/leilo_veiculos.json
           retention-days: 3
 
       - name: Generate Summary
         if: always()
         run: |
-          echo "## 🔵 Leilo.com.br — Coleta + Upload Supabase" >> $GITHUB_STEP_SUMMARY
+          echo "## 🚗 Leilo — Veículos" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
@@ -99,3 +112,95 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Scraper:** Playwright (Chromium headless)" >> $GITHUB_STEP_SUMMARY
           echo "**Paginação:** Todas as páginas disponíveis" >> $GITHUB_STEP_SUMMARY
+
+  leilo-gpu:
+    name: 🎮 Leilo - GPUs → auctions.tecnologia
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    if: |
+      github.event_name == 'schedule' ||
+      inputs.job == 'todos' ||
+      inputs.job == 'gpu'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          pip install requests==2.31.0 python-dotenv==1.0.1 playwright==1.44.0 httpx==0.27.0
+
+      - name: Install Playwright Browsers
+        run: |
+          playwright install chromium --with-deps
+
+      - name: Run Leilo GPU Scraper
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          PYTHONPATH: ${{ github.workspace }}/scrapers
+        run: |
+          echo "========================================"
+          echo "🎮 LEILO.COM.BR - PLACAS DE VÍDEO"
+          echo "========================================"
+          echo "📅 Início: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "🇧🇷 Horário Brasil: $(TZ='America/Sao_Paulo' date '+%Y-%m-%d %H:%M:%S BRT')"
+          echo "========================================"
+          echo ""
+          echo "🔥 Coletando: Equipamentos → GPUs"
+          echo "🔍 Preços: Mercado Livre (scraping)"
+          echo "☁️  Destino: auctions.tecnologia (Supabase)"
+          echo "========================================"
+
+          cd scrapers/leilo
+          python leilo_gpu.py --output /tmp/leilo_gpu.json
+
+          echo ""
+          echo "✅ Leilo GPU concluído: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+      - name: Upload JSON (Debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: leilo-gpu-${{ github.run_number }}
+          path: /tmp/leilo_gpu.json
+          retention-days: 3
+
+      - name: Generate Summary
+        if: always()
+        run: |
+          echo "## 🎮 Leilo — GPUs" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "**Modo:** Manual" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Modo:** Cron (automático diário)" >> $GITHUB_STEP_SUMMARY
+            echo "**Frequência:** Diariamente às 6h UTC (3h BRT)" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Horário UTC:** $(date -u '+%Y-%m-%d %H:%M')" >> $GITHUB_STEP_SUMMARY
+          echo "**Horário Brasil:** $(TZ='America/Sao_Paulo' date '+%Y-%m-%d %H:%M')" >> $GITHUB_STEP_SUMMARY
+          echo "**Run ID:** ${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Categoria Processada:" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Equipamentos → sub_categoria: placa_de_video" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔍 Enriquecimento:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Fonte de preços:** Mercado Livre (Playwright scraping)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Campos calculados:** preco_mercado, percentual_abaixo_mercado, margem_revenda" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tags automáticas:** super_oferta / boa_oferta / oportunidade / margem_alta" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ☁️ Destino:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Schema:** auctions" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tabela:** tecnologia" >> $GITHUB_STEP_SUMMARY
+          echo "- **Conflict key:** link (URL do lote)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Scraper:** Playwright (Chromium headless)" >> $GITHUB_STEP_SUMMARY
